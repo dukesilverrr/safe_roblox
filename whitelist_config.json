@@ -1,0 +1,15 @@
+{
+  "roblox_user_id": 0,
+  "roblosecurity_cookie": "PASTE_YOUR_COOKIE_HERE",
+  "poll_interval_seconds": 5,
+  "auto_kill": true,
+  "notify_parent": true,
+  "log_file": "guardian.log",
+
+  "whitelisted_universes": {
+    "13822889": "Adopt Me!",
+    "2753915549": "Blox Fruits",
+    "1224212277": "Murder Mystery 2",
+    "3260590327": "Brookhaven RP"
+  }
+}
