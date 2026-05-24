@@ -60,6 +60,7 @@ from urllib.parse import quote
 # ── Configuration ────────────────────────────────────────────────────────────
 
 CONFIG_FILE = Path(__file__).parent / "whitelist_config.json"
+DEFAULT_WHITELIST_FILENAME = "whitelist_universes.json"
 
 DEFAULT_CONFIG = {
     "roblox_user_id": 0,
@@ -70,13 +71,18 @@ DEFAULT_CONFIG = {
     "telegram_bot_token": "",
     "parent_chat_ids": [],
     "kill_local_process_on_violation": False,
-    "whitelisted_universes": {
-        "# Example — replace with your own": "",
-        "# Run:  python roblox_whitelist_guardian.py --lookup \"Game Name\"": "",
-        "# to find Universe IDs for games you want to allow.": ""
-    }
+    "whitelist_file": DEFAULT_WHITELIST_FILENAME
     # Log file path is derived from the config path:
     # `--config emma.json` → `emma.log` next to the config.
+}
+
+# Default contents of the shared universe-whitelist file. Keys that
+# don't parse as int are silently skipped, so the `# Example` lines
+# act as inline documentation for first-time users.
+DEFAULT_WHITELIST = {
+    "# Example — replace these with the Universe IDs you allow": "",
+    "# Run:  python roblox_whitelist_guardian.py --lookup \"Game Name\"": "",
+    "# to find Universe IDs for games you want to whitelist.": ""
 }
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -97,6 +103,76 @@ def setup_logging(log_path: str, debug: bool = False) -> logging.Logger:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
+
+
+# ── Whitelist loading ────────────────────────────────────────────────────────
+
+def load_whitelist(config: dict, config_path: Path,
+                   logger: logging.Logger = None) -> dict:
+    """
+    Resolve the universe whitelist for a kid's config and return a
+    {int(universe_id): str(friendly_name)} map.
+
+    Source priority:
+      1. `whitelist_file` — path to a JSON file containing the whitelist
+         map directly (top-level keys ARE the universe IDs). This is the
+         recommended form when running multiple kids — point each kid's
+         config at the same shared whitelist file. Relative paths
+         resolve next to the kid's config file.
+      2. Inline `whitelisted_universes` dict in the kid's config
+         (backward compat). If both are set, file wins with a warning.
+
+    Keys that don't parse as int (e.g. `"# Example"` comment-style
+    entries) are silently skipped — useful for inline documentation
+    inside the JSON.
+
+    Raises RuntimeError if `whitelist_file` is set but unreadable —
+    we'd rather fail loud than silently allow every game.
+    """
+    wl_file = config.get("whitelist_file", "")
+    inline = config.get("whitelisted_universes")
+
+    if wl_file:
+        if inline and logger:
+            logger.warning(
+                "Config has both whitelist_file and whitelisted_universes; "
+                "using whitelist_file and ignoring the inline list."
+            )
+        wl_path = Path(wl_file)
+        if not wl_path.is_absolute():
+            wl_path = Path(config_path).parent / wl_path
+        try:
+            with open(wl_path) as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"whitelist_file not found: {wl_path}. Create it with "
+                f"--init or point whitelist_file at an existing JSON map."
+            )
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"whitelist_file {wl_path} is not valid JSON: {e}"
+            )
+        if not isinstance(raw, dict):
+            raise RuntimeError(
+                f"whitelist_file {wl_path} must contain a JSON object "
+                f"of universe_id → name, got {type(raw).__name__}."
+            )
+    elif inline is not None:
+        raw = inline
+    else:
+        raw = {}
+
+    result: dict = {}
+    for key, val in raw.items():
+        try:
+            uid = int(key)
+            result[uid] = str(val) if val else f"Universe {uid}"
+        except (ValueError, TypeError):
+            # Comment-style keys ("# Example...") fall here. Drop them.
+            pass
+    return result
+
 
 # ── Roblox API helpers ───────────────────────────────────────────────────────
 
@@ -518,15 +594,13 @@ class WhitelistGuardian:
         # whoami() lands at startup. Pre-seed from config as fallback.
         self.account_name = ""
 
-        # Build whitelist: {universe_id: friendly_name}
-        raw = config.get("whitelisted_universes", {})
-        self.whitelist: dict[int, str] = {}
-        for key, val in raw.items():
-            try:
-                uid = int(key)
-                self.whitelist[uid] = str(val) if val else f"Universe {uid}"
-            except (ValueError, TypeError):
-                pass
+        # Resolve the universe whitelist (file pointer preferred over
+        # inline). load_whitelist will raise if the referenced file is
+        # missing or malformed — that's intentional; the daemon should
+        # not silently allow everything if its whitelist is broken.
+        self.whitelist: dict[int, str] = load_whitelist(
+            config, self.config_path, self.logger
+        )
 
         self.running = True
         self._last_universe = None
@@ -1214,11 +1288,29 @@ def main():
     if args.init:
         if config_path.exists():
             print(f"Config already exists: {config_path}")
-            return
-        with open(config_path, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
-        print(f"Created config: {config_path}")
-        print("Edit it with your child's User ID, cookie, and whitelisted games.")
+        else:
+            with open(config_path, "w") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2)
+            print(f"Created config: {config_path}")
+
+        # Also create the shared whitelist file next to the config if
+        # missing. When you --init a SECOND kid's config, the first
+        # kid's whitelist file is reused — that's the whole point of
+        # splitting it out.
+        wl_path = config_path.parent / DEFAULT_WHITELIST_FILENAME
+        if wl_path.exists():
+            print(f"Whitelist file already exists (reusing): {wl_path}")
+        else:
+            with open(wl_path, "w") as f:
+                json.dump(DEFAULT_WHITELIST, f, indent=2)
+            print(f"Created whitelist: {wl_path}")
+
+        print()
+        print("Next:")
+        print(f"  1. Edit {config_path.name} with the kid's user_id, cookie,")
+        print(f"     child_display_name, telegram_bot_token, parent_chat_ids.")
+        print(f"  2. Edit {wl_path.name} with the allowed universe IDs.")
+        print(f"     (Use --lookup or --place-to-universe to find them.)")
         return
 
     # ── Monitor mode

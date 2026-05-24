@@ -127,7 +127,13 @@ python roblox_whitelist_guardian.py --place-to-universe 920587237
 
 ### 5. Edit the config file
 
+The kid config holds per-kid stuff. The allowed games live in a
+**separate file** (`whitelist_universes.json` by default) that one or
+more kid configs can point at via `whitelist_file`. Running `--init`
+creates both files.
+
 ```json
+// emma.json
 {
   "roblox_user_id": 123456789,
   "roblosecurity_cookie": "_|WARNING:-DO-NOT-SHARE-THIS...",
@@ -140,12 +146,27 @@ python roblox_whitelist_guardian.py --place-to-universe 920587237
 
   "kill_local_process_on_violation": false,
 
-  "whitelisted_universes": {
-    "383310974": "Adopt Me!",
-    "994732206": "Blox Fruits"
-  }
+  "whitelist_file": "whitelist_universes.json"
 }
 ```
+
+```json
+// whitelist_universes.json (shared across all kid configs)
+{
+  "383310974": "Adopt Me!",
+  "994732206": "Blox Fruits",
+  "66654135": "Murder Mystery 2",
+  "1686885941": "Brookhaven RP"
+}
+```
+
+The path in `whitelist_file` resolves **relative to the kid config**,
+not the current working directory — so `"whitelist_file": "shared.json"`
+always means "next to this config", regardless of where you run the
+script from. An absolute path works too.
+
+If the file is missing or malformed, the daemon refuses to start
+rather than silently allowing everything.
 
 > **Where do logs go?** The log file path is derived from the config
 > filename: `whitelist_config.json` → `whitelist_config.log`,
@@ -228,24 +249,31 @@ enabling if the daemon is on the actual play machine.
 Run **one daemon process per child**, each with its own config file
 passed via `--config`. The Telegram bot token can (and should) be
 shared via the `TELEGRAM_BOT_TOKEN` env var so you don't duplicate
-the secret across files.
+the secret across files. The **allowed-games list is shared too** —
+all kid configs point their `whitelist_file` at a single
+`whitelist_universes.json`, so editing it once updates the whitelist
+for every kid.
 
 ### Setup
 
 1. Create one config file per kid, in the script's directory or
-   wherever you want:
+   wherever you want. The first `--init` also creates the shared
+   `whitelist_universes.json`; the second `--init` reuses it:
 
    ```bash
    python roblox_whitelist_guardian.py --config emma.json --init
    python roblox_whitelist_guardian.py --config jacob.json --init
    ```
 
-2. Fill in each file with that kid's `roblox_user_id`,
-   `roblosecurity_cookie`, `child_display_name`, `parent_chat_ids`,
-   and `whitelisted_universes`. The log file path is automatic —
-   `emma.json` writes to `emma.log`, `jacob.json` writes to `jacob.log`
-   — so kids never share a log. The `telegram_bot_token` can be left
-   empty if you set `TELEGRAM_BOT_TOKEN` in the environment.
+2. Fill in each kid file with that kid's `roblox_user_id`,
+   `roblosecurity_cookie`, `child_display_name`, and
+   `parent_chat_ids`. Both configs already point at the shared
+   `whitelist_universes.json`, so edit that ONE file with the allowed
+   games — every kid automatically inherits it. The log file path is
+   automatic too (`emma.json` writes to `emma.log`,
+   `jacob.json` writes to `jacob.log`), so kids never share a log.
+   The `telegram_bot_token` can be left empty if you set
+   `TELEGRAM_BOT_TOKEN` in the environment.
 
 3. Verify each independently before starting either daemon:
 
@@ -269,8 +297,10 @@ the secret across files.
   needed, no clobbering.
 - **Cookies don't share**: each `.ROBLOSECURITY` is account-specific.
   Refresh each kid's cookie independently when it dies.
-- **Whitelists can differ**: an older kid might have a longer allowed
-  list than a younger sibling — that's the whole point of per-kid configs.
+- **Whitelist is shared by default**: edit `whitelist_universes.json`
+  once, all kids see it. If you want a more permissive list for an
+  older kid, point that kid's `whitelist_file` at a separate file
+  (e.g. `whitelist_older_kids.json`) instead.
 - **Same `parent_chat_ids`**: usually you want both parents notified
   regardless of which kid triggered it, so the chat-ID list will be
   identical across files. (Or use a single Telegram group chat that
@@ -345,16 +375,54 @@ Create `~/Library/LaunchAgents/com.roblox.guardian.plist`:
 ```
 Then: `launchctl load ~/Library/LaunchAgents/com.roblox.guardian.plist`
 
-### Linux (systemd)
+### Linux (systemd) — automated installer
+
+The repo ships `install-service.sh`, which writes a systemd template
+unit (`roblox-guardian@.service`) and enables one instance per kid
+config it finds in the current directory.
+
+```bash
+# Install: writes the unit, stashes the bot token in ./.env (chmod 600),
+# then enables + starts roblox-guardian@<kidname> for every detected config.
+sudo ./install-service.sh install --token '12345:ABC-DEF...'
+
+# Check that every instance is alive
+sudo ./install-service.sh status
+
+# Or directly:
+sudo systemctl status 'roblox-guardian@*'
+sudo journalctl -u roblox-guardian@emma -f       # follow a kid's logs
+
+# Tear down (stops + disables all instances, removes the unit file;
+# leaves your configs and the .env alone)
+sudo ./install-service.sh uninstall
+```
+
+The script auto-detects kid configs by scanning `*.json` for any file
+with `roblox_user_id` set to a non-zero integer (so the shared
+`whitelist_universes.json` is correctly skipped). The daemon runs as
+the user who invoked `sudo`, not as root, so configs/logs keep their
+normal ownership.
+
+If you'd rather wire it up manually, the template the installer writes
+looks like this:
+
 ```ini
 [Unit]
-Description=Roblox Whitelist Guardian
-After=network.target
+Description=Roblox Whitelist Guardian for %i
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /path/to/roblox_whitelist_guardian.py
+Type=simple
+User=<your-user>
+WorkingDirectory=<repo-dir>
+EnvironmentFile=-<repo-dir>/.env
+ExecStart=/usr/bin/python3 <repo-dir>/roblox_whitelist_guardian.py --config <repo-dir>/%i.json
 Restart=always
 RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -381,7 +449,20 @@ cookie was grabbed from (see Troubleshooting).
 | `telegram_bot_token` | `""` | Token from @BotFather. Env: `TELEGRAM_BOT_TOKEN` (preferred). |
 | `parent_chat_ids` | `[]` | Telegram chat IDs that receive violation alerts (integers; negative for group chats). Discover with `--list-chats`. |
 | `kill_local_process_on_violation` | `false` | If `true`, also kill the local Roblox process on violation. Only useful on the kid's actual play machine. |
-| `whitelisted_universes` | `{}` | Map of Universe ID → friendly name |
+| `whitelist_file` | `"whitelist_universes.json"` | Path to a JSON file containing the allowed-universes map (relative paths resolve next to this config). Multiple kid configs can share one. |
+| `whitelisted_universes` | (deprecated) | Inline `{universe_id: name}` map. Backward-compat; if both `whitelist_file` and this are set, file wins. |
+
+The shared whitelist file is just a flat JSON object — `{"<universe_id>": "<friendly name>"}`:
+
+```json
+{
+  "383310974": "Adopt Me!",
+  "994732206": "Blox Fruits"
+}
+```
+
+Keys that aren't valid integers (e.g. `"# Example..."`) are silently
+ignored, so you can inline-comment if you want.
 
 Log file path is **not** a config field — it's derived from the config
 filename: `<name>.json` → `<name>.log`, next to the config. (For backward
