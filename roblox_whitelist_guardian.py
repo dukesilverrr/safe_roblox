@@ -2,27 +2,43 @@
 """
 Roblox Whitelist Guardian
 ─────────────────────────
-Parental control script that restricts a child's Roblox account to only
-whitelisted experiences. Works for both the native Roblox app and browser.
+Parental detection script: monitors a child's Roblox account, and when
+they join an experience that's NOT on the whitelist, sends a Telegram
+message to every parent chat ID with the child's name and the experience.
 
 How it works:
   1. Polls the Roblox Presence API every few seconds to see what game
      the monitored account is currently in.
-  2. If the game is NOT on your whitelist, it kills the Roblox process
-     (native app) or browser tab, pulling the child out of the game.
-  3. Logs every action and optionally sends desktop notifications.
+  2. If the game is NOT on your whitelist, the bot sends a Telegram
+     message to every chat in parent_chat_ids. The parent then
+     intervenes manually (talk to the kid, take the device, etc.).
+  3. Logs every detection and optionally pops a desktop notification
+     on the machine running the daemon.
+
+  Note: Roblox no longer permits programmatic session invalidation
+  (the old endpoint requires step-up auth that cookie-only API clients
+  can't obtain). Detection + parent notification is the realistic
+  path. See README "Troubleshooting" for details.
 
 Setup:
   1. Get your child's Roblox User ID (from their profile URL).
   2. Get a .ROBLOSECURITY cookie (log into their account in a browser,
      open DevTools → Application → Cookies → .ROBLOSECURITY).
   3. Find the Universe IDs of games you want to allow (see helper below).
-  4. Fill in whitelist_config.json and run this script.
+  4. Create a Telegram bot via @BotFather, paste the token into
+     telegram_bot_token (or set TELEGRAM_BOT_TOKEN env var).
+  5. Have each parent send /start to the bot, then run --list-chats
+     to discover their chat IDs. Paste into parent_chat_ids.
+  6. Run --test-telegram to verify delivery, then start the daemon.
 
 Usage:
-  python roblox_whitelist_guardian.py                  # normal mode
-  python roblox_whitelist_guardian.py --lookup "Adopt Me"  # find a game's Universe ID
-  python roblox_whitelist_guardian.py --dry-run         # monitor without killing
+  python roblox_whitelist_guardian.py                       # normal mode
+  python roblox_whitelist_guardian.py --check                # preflight diagnostic
+  python roblox_whitelist_guardian.py --list-chats           # discover parent chat IDs
+  python roblox_whitelist_guardian.py --test-telegram        # verify delivery
+  python roblox_whitelist_guardian.py --debug                # verbose per-poll logging
+  python roblox_whitelist_guardian.py --lookup "Adopt Me"    # find Universe ID
+  python roblox_whitelist_guardian.py --dry-run              # monitor only, don't notify
 """
 
 import argparse
@@ -30,6 +46,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -43,34 +60,39 @@ from urllib.parse import quote
 # ── Configuration ────────────────────────────────────────────────────────────
 
 CONFIG_FILE = Path(__file__).parent / "whitelist_config.json"
-LOG_FILE = Path(__file__).parent / "guardian.log"
 
 DEFAULT_CONFIG = {
     "roblox_user_id": 0,
     "roblosecurity_cookie": "PASTE_YOUR_COOKIE_HERE",
     "poll_interval_seconds": 5,
-    "auto_kill": True,
     "notify_parent": True,
+    "child_display_name": "",
+    "telegram_bot_token": "",
+    "parent_chat_ids": [],
+    "kill_local_process_on_violation": False,
     "whitelisted_universes": {
         "# Example — replace with your own": "",
         "# Run:  python roblox_whitelist_guardian.py --lookup \"Game Name\"": "",
         "# to find Universe IDs for games you want to allow.": ""
-    },
-    "log_file": str(LOG_FILE)
+    }
+    # Log file path is derived from the config path:
+    # `--config emma.json` → `emma.log` next to the config.
 }
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-def setup_logging(log_path: str) -> logging.Logger:
+def setup_logging(log_path: str, debug: bool = False) -> logging.Logger:
     logger = logging.getLogger("guardian")
-    logger.setLevel(logging.INFO)
+    target_level = logging.DEBUG if debug else logging.INFO
+    if logger.handlers:
+        logger.setLevel(target_level)
+        return logger
+    logger.setLevel(target_level)
     fmt = logging.Formatter("[%(asctime)s] %(levelname)s  %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
-    # Console
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     logger.addHandler(ch)
-    # File
     fh = logging.FileHandler(log_path)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
@@ -79,104 +101,230 @@ def setup_logging(log_path: str) -> logging.Logger:
 # ── Roblox API helpers ───────────────────────────────────────────────────────
 
 API_PRESENCE = "https://presence.roblox.com/v1/presence/users"
-API_GAME_SEARCH = "https://games.roblox.com/v1/games/list"
 API_UNIVERSE_DETAILS = "https://games.roblox.com/v1/games"
-API_SEARCH_GAMES = "https://apis.roblox.com/search-api/omni-search"
+API_AUTHENTICATED = "https://users.roblox.com/v1/users/authenticated"
+# Note: Roblox's session-invalidation endpoints (logoutfromallsessions...,
+# /v2/logout, etc.) require step-up auth (RBXBoundAuthToken cookie issued
+# only via the live browser login flow) that cookie-only API clients can't
+# obtain. The guardian therefore notifies parents via SMS rather than
+# attempting programmatic kicks. See README "Troubleshooting".
+
+PRESENCE_TYPE_NAMES = {0: "offline", 1: "website", 2: "in-game", 3: "in-studio"}
 
 
-def api_request(url: str, cookie: str, method: str = "GET",
-                data: dict = None) -> dict:
-    """Make an authenticated request to the Roblox API."""
-    headers = {
-        "Cookie": f".ROBLOSECURITY={cookie}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    body = json.dumps(data).encode() if data else None
-    req = Request(url, data=body, headers=headers,
-                  method="POST" if data else method)
-    try:
-        with urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
-    except HTTPError as e:
-        error_body = e.read().decode() if e.fp else ""
-        raise RuntimeError(f"Roblox API {e.code}: {error_body}") from e
-    except URLError as e:
-        raise RuntimeError(f"Network error: {e.reason}") from e
+class RobloxSession:
+    """
+    Manages a Roblox API session with automatic CSRF token handling
+    and cookie rotation (required since May 2026 format changes).
 
+    Roblox now periodically rotates .ROBLOSECURITY cookies via Set-Cookie
+    response headers. If a script ignores these, the old cookie eventually
+    returns 401. This class intercepts Set-Cookie on EVERY response and
+    persists the new cookie to the config file automatically.
+    """
 
-def get_presence(user_id: int, cookie: str) -> dict:
-    """Get the current presence/game status for a user."""
-    result = api_request(API_PRESENCE, cookie, data={"userIds": [user_id]})
-    presences = result.get("userPresences", [])
-    if not presences:
-        raise RuntimeError(f"No presence data for user {user_id}")
-    return presences[0]
+    def __init__(self, cookie: str, config_path: Path = CONFIG_FILE,
+                 logger: logging.Logger = None):
+        self.cookie = cookie
+        self.csrf_token = ""
+        self.config_path = config_path
+        self.logger = logger or logging.getLogger("guardian")
 
+    def _build_headers(self, extra: dict = None) -> dict:
+        headers = {
+            "Cookie": f".ROBLOSECURITY={self.cookie}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # Roblox filters out requests with Python-urllib/* default UA
+            # on several endpoints (omni-search returns empty, some auth
+            # endpoints can 401). A Mozilla-prefixed UA is enough to
+            # pass the filter.
+            "User-Agent": "Mozilla/5.0 (RobloxWhitelistGuardian)",
+        }
+        if self.csrf_token:
+            headers["X-CSRF-TOKEN"] = self.csrf_token
+        if extra:
+            headers.update(extra)
+        return headers
 
-def get_universe_details(universe_ids: list[int], cookie: str) -> dict:
-    """Get details (name, etc.) for universe IDs."""
-    ids_param = ",".join(str(uid) for uid in universe_ids)
-    url = f"{API_UNIVERSE_DETAILS}?universeIds={ids_param}"
-    return api_request(url, cookie)
+    def _check_cookie_rotation(self, headers):
+        """
+        Check every API response for Set-Cookie headers containing a
+        rotated .ROBLOSECURITY value. If found, update in memory and
+        persist to config. This is REQUIRED since the May 2026 changes —
+        Roblox rotates cookies opportunistically on any response, not
+        only on logout-and-reauth.
+        """
+        new_cookie = self._extract_cookie(headers)
+        if new_cookie and new_cookie != self.cookie:
+            old_prefix = self.cookie[:20]
+            self.cookie = new_cookie
+            self._save_cookie(new_cookie)
+            self.logger.info(
+                f"🔑 Cookie rotated by Roblox "
+                f"({old_prefix}... → {new_cookie[:20]}...)"
+            )
 
-
-def search_games(keyword: str, cookie: str) -> list[dict]:
-    """Search for Roblox games by keyword. Returns basic results."""
-    url = (f"https://games.roblox.com/v1/games/list?"
-           f"model.keyword={quote(keyword)}"
-           f"&model.startRows=0&model.maxRows=10")
-    try:
-        result = api_request(url, cookie)
-        return result.get("games", [])
-    except Exception:
-        # Fallback: use the catalog search
-        url2 = (f"https://www.roblox.com/games/list-json?"
-                f"keyword={quote(keyword)}&startRows=0&maxRows=10")
+    def request(self, url: str, method: str = "GET",
+                data: dict = None, retry_csrf: bool = True) -> dict:
+        """
+        Make an authenticated Roblox API request.
+        Handles both CSRF token rotation (403 → retry with new token)
+        and cookie rotation (Set-Cookie on any response).
+        """
+        body = json.dumps(data).encode() if data else None
+        effective_method = "POST" if data and method == "GET" else method
+        req = Request(url, data=body, headers=self._build_headers(),
+                      method=effective_method)
         try:
-            result = api_request(url2, cookie)
-            return result.get("games", [])
+            with urlopen(req, timeout=15) as resp:
+                self._check_cookie_rotation(resp.headers)
+                raw = resp.read().decode()
+                return json.loads(raw) if raw.strip() else {}
+        except HTTPError as e:
+            # Check for cookie rotation even on error responses
+            self._check_cookie_rotation(e.headers)
+            # CSRF token rotation: Roblox returns 403 with new token
+            if e.code == 403 and retry_csrf:
+                new_token = e.headers.get("x-csrf-token", "")
+                if new_token:
+                    self.csrf_token = new_token
+                    return self.request(url, method, data,
+                                        retry_csrf=False)
+            error_body = ""
+            try:
+                error_body = e.read().decode()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Roblox API {e.code} @ {url}: {error_body}"
+            ) from e
+        except URLError as e:
+            raise RuntimeError(f"Network error: {e.reason}") from e
+
+    def request_raw(self, url: str, method: str = "POST",
+                    data: dict = None, retry_csrf: bool = True,
+                    extra_headers: dict = None, raw_body: bytes = None):
+        """
+        Like request() but returns the raw HTTPResponse so we can read
+        Set-Cookie headers (needed for session re-auth).
+        Returns (status_code, headers, body_str).
+
+        `extra_headers` adds/overrides headers (e.g. a Referer, or a
+        non-JSON Content-Type for endpoints that demand form-urlencoded).
+        `raw_body` lets the caller send a literal byte body instead of
+        json-encoding `data` — needed for form-urlencoded POSTs.
+        """
+        if raw_body is not None:
+            body = raw_body
+        else:
+            body = json.dumps(data).encode() if data else None
+        req = Request(url, data=body,
+                      headers=self._build_headers(extra=extra_headers),
+                      method=method)
+        try:
+            with urlopen(req, timeout=15) as resp:
+                self._check_cookie_rotation(resp.headers)
+                return resp.status, resp.headers, resp.read().decode()
+        except HTTPError as e:
+            self._check_cookie_rotation(e.headers)
+            if e.code == 403 and retry_csrf:
+                new_token = e.headers.get("x-csrf-token", "")
+                if new_token:
+                    self.csrf_token = new_token
+                    return self.request_raw(
+                        url, method, data,
+                        retry_csrf=False,
+                        extra_headers=extra_headers,
+                        raw_body=raw_body,
+                    )
+            body_text = ""
+            try:
+                body_text = e.read().decode()
+            except Exception:
+                pass
+            return e.code, e.headers, body_text
+
+    def whoami(self) -> dict | None:
+        """
+        Validate the cookie by hitting the /authenticated endpoint.
+        Returns user info dict on success, or None if the cookie is
+        invalid (401). Raises on other errors (network, unexpected status).
+        """
+        status, _headers, body = self.request_raw(
+            API_AUTHENTICATED, method="GET"
+        )
+        if status == 401:
+            return None
+        if 200 <= status < 300:
+            return json.loads(body) if body.strip() else {}
+        raise RuntimeError(
+            f"whoami got unexpected status {status} from "
+            f"{API_AUTHENTICATED}: {body}"
+        )
+
+    def get_presence(self, user_id: int) -> dict:
+        """Get current presence/game status for a user."""
+        result = self.request(API_PRESENCE, data={"userIds": [user_id]})
+        presences = result.get("userPresences", [])
+        if not presences:
+            raise RuntimeError(f"No presence data for user {user_id}")
+        return presences[0]
+
+    def _extract_cookie(self, headers) -> str:
+        """Extract .ROBLOSECURITY from Set-Cookie headers."""
+        # headers can have multiple Set-Cookie entries
+        cookies = headers.get_all("Set-Cookie") or []
+        if isinstance(cookies, str):
+            cookies = [cookies]
+        for cookie_str in cookies:
+            match = re.search(
+                r'\.ROBLOSECURITY=([^;]+)', cookie_str
+            )
+            if match:
+                return match.group(1)
+        return ""
+
+    def _save_cookie(self, new_cookie: str):
+        """
+        Persist the rotated cookie back to the config file atomically.
+        Write to a sibling temp file then os.replace() — that's atomic
+        on POSIX and Windows, so a crash mid-write can't truncate the
+        user's config and lose their cookie.
+        """
+        try:
+            with open(self.config_path) as f:
+                config = json.load(f)
+            config["roblosecurity_cookie"] = new_cookie
+            tmp_path = f"{self.config_path}.tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(config, f, indent=2)
+            os.replace(tmp_path, self.config_path)
         except Exception:
-            return []
-
-
-def search_games_simple(keyword: str) -> list[dict]:
-    """
-    Search for Roblox games using the public search endpoint.
-    No authentication required.
-    """
-    url = (f"https://games.roblox.com/v1/games/list?"
-           f"model.keyword={quote(keyword)}"
-           f"&model.startRows=0&model.maxRows=10")
-    headers = {"Accept": "application/json"}
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            return data.get("games", [])
-    except Exception:
-        pass
-
-    # Alternate: try the catalog search API
-    url2 = (f"https://catalog.roblox.com/v1/search/items?"
-            f"category=9&keyword={quote(keyword)}&limit=10")
-    req2 = Request(url2, headers=headers)
-    try:
-        with urlopen(req2, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            return data.get("data", [])
-    except Exception:
-        return []
+            # Non-fatal: the in-memory cookie is already updated, so
+            # the running process keeps working with the new cookie
+            # even if we can't persist it.
+            pass
 
 
 # ── Process management ───────────────────────────────────────────────────────
 
 def kill_roblox() -> list[str]:
-    """Kill all Roblox-related processes. Returns list of killed process names."""
+    """
+    Kill all Roblox-related processes. Returns list of killed process names.
+
+    IMPORTANT: never use `pkill -f` here. The -f flag matches the full
+    command line, which means it would match our OWN Python process
+    (because this script's filename literally contains "roblox") and
+    the guardian would terminate itself the moment local enforcement
+    fires. Always match on exact basename via `pkill -x` (POSIX) or
+    `taskkill /IM <image.exe>` (Windows).
+    """
     system = platform.system()
     killed = []
 
     if system == "Windows":
+        # /IM matches exact image name — already self-safe.
         targets = [
             "RobloxPlayerBeta.exe",
             "RobloxPlayerLauncher.exe",
@@ -192,33 +340,30 @@ def kill_roblox() -> list[str]:
                     killed.append(proc)
             except Exception:
                 pass
+        return killed
 
-    elif system == "Darwin":  # macOS
+    # POSIX (macOS / Linux): pkill -x matches the process basename
+    # exactly, not the command line. Our Python script (basename
+    # "python3") will not match "Roblox", "RobloxPlayer", or "sober".
+    if system == "Darwin":
         targets = ["Roblox", "RobloxPlayer"]
-        for proc in targets:
-            try:
-                result = subprocess.run(
-                    ["pkill", "-f", proc],
-                    capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0:
-                    killed.append(proc)
-            except Exception:
-                pass
+    else:
+        # Native Roblox doesn't exist on Linux; users typically run
+        # Sober (the Linux Roblox wrapper). RobloxPlayerBeta.exe covers
+        # Wine setups, though Linux truncates process comm to 15 chars
+        # so it may not match exactly — keep it for best-effort.
+        targets = ["sober", "RobloxPlayerBeta"]
 
-    else:  # Linux
-        targets = ["Roblox", "roblox"]
-        for proc in targets:
-            try:
-                result = subprocess.run(
-                    ["pkill", "-f", proc],
-                    capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0:
-                    killed.append(proc)
-            except Exception:
-                pass
-
+    for proc in targets:
+        try:
+            result = subprocess.run(
+                ["pkill", "-x", proc],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                killed.append(proc)
+        except Exception:
+            pass
     return killed
 
 
@@ -232,7 +377,6 @@ def send_notification(title: str, message: str):
                 f'display notification "{message}" with title "{title}"'
             ], timeout=5)
         elif system == "Windows":
-            # PowerShell toast notification
             ps_script = (
                 f'[Windows.UI.Notifications.ToastNotificationManager,'
                 f'Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null; '
@@ -251,19 +395,128 @@ def send_notification(title: str, message: str):
         else:
             subprocess.run(["notify-send", title, message], timeout=5)
     except Exception:
-        pass  # Notifications are best-effort
+        pass
+
+
+# ── Telegram notifications ───────────────────────────────────────────────────
+
+TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}"
+
+
+def send_telegram_message(bot_token: str, chat_id, text: str,
+                          logger: logging.Logger) -> bool:
+    """
+    Send a Telegram message to a single chat_id via the bot's sendMessage
+    endpoint. Returns True on success.
+
+    chat_id is an integer (positive for private chats, negative for
+    groups). bot_token comes from @BotFather when the bot is created.
+    Telegram has no per-message cost and no carrier hassles, so this
+    is free as long as recipients have started a chat with the bot.
+    """
+    if not bot_token:
+        logger.error("   Telegram: bot token missing; skipping.")
+        return False
+
+    url = f"{TELEGRAM_API_BASE.format(token=bot_token)}/sendMessage"
+    payload = json.dumps({
+        "chat_id": chat_id,
+        "text": text[:4096],   # Telegram caps message text at 4096 chars
+        "disable_web_page_preview": True,
+    }).encode()
+    req = Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }, method="POST")
+    try:
+        with urlopen(req, timeout=10) as r:
+            body = json.loads(r.read().decode())
+            if body.get("ok"):
+                return True
+            logger.error(
+                f"   Telegram to chat {chat_id} returned not-ok: "
+                f"{body.get('description', '<no description>')}"
+            )
+            return False
+    except HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode()[:300]
+        except Exception:
+            pass
+        # Common failure: 400 "chat not found" → recipient never /started
+        # the bot, OR the chat_id is wrong.
+        logger.error(
+            f"   Telegram to chat {chat_id} failed: HTTP {e.code} — {err_body}"
+        )
+        return False
+    except URLError as e:
+        logger.error(
+            f"   Telegram to chat {chat_id} network error: {e.reason}"
+        )
+        return False
+
+
+def telegram_get_updates(bot_token: str, offset: int = 0,
+                         timeout_seconds: int = 30) -> list:
+    """
+    Long-poll the bot's getUpdates endpoint. Returns the `result` array
+    (list of update dicts) — used by --list-chats to discover the chat
+    IDs of parents who have messaged the bot.
+    """
+    url = (
+        f"{TELEGRAM_API_BASE.format(token=bot_token)}/getUpdates"
+        f"?offset={offset}&timeout={timeout_seconds}"
+    )
+    # urlopen's timeout must exceed Telegram's long-poll window.
+    req = Request(url, headers={"Accept": "application/json"})
+    with urlopen(req, timeout=timeout_seconds + 5) as r:
+        body = json.loads(r.read().decode())
+    if not body.get("ok"):
+        raise RuntimeError(
+            f"getUpdates failed: {body.get('description', body)}"
+        )
+    return body.get("result", [])
 
 
 # ── Core monitor loop ────────────────────────────────────────────────────────
 
 class WhitelistGuardian:
-    def __init__(self, config: dict, dry_run: bool = False):
+    def __init__(self, config: dict, dry_run: bool = False,
+                 debug: bool = False, config_path: Path = None):
         self.user_id = config["roblox_user_id"]
-        self.cookie = config["roblosecurity_cookie"]
+        self.config_path = config_path or CONFIG_FILE
+        # Log file is derived from the config path: `emma.json` → `emma.log`.
+        # An explicit `log_file` in the config still wins (backward compat).
+        default_log_path = str(Path(self.config_path).with_suffix(".log"))
+        log_path = config.get("log_file") or default_log_path
+        self.logger = setup_logging(log_path, debug=debug)
+        self.session = RobloxSession(
+            config["roblosecurity_cookie"],
+            config_path=self.config_path,
+            logger=self.logger,
+        )
         self.poll_interval = config.get("poll_interval_seconds", 5)
-        self.auto_kill = config.get("auto_kill", True)
         self.notify = config.get("notify_parent", True)
         self.dry_run = dry_run
+        self.debug = debug
+
+        # Telegram notification config. The bot token is a secret —
+        # env var TELEGRAM_BOT_TOKEN takes precedence over the config
+        # file so it can stay off-disk if you'd like.
+        self.child_display_name = config.get("child_display_name", "")
+        self.parent_chat_ids = list(config.get("parent_chat_ids", []))
+        self.telegram_bot_token = (
+            os.environ.get("TELEGRAM_BOT_TOKEN")
+            or config.get("telegram_bot_token", "")
+        )
+        self.kill_local_process = bool(
+            config.get("kill_local_process_on_violation", False)
+        )
+
+        # We'll be ready to identify the child in SMS bodies once
+        # whoami() lands at startup. Pre-seed from config as fallback.
+        self.account_name = ""
 
         # Build whitelist: {universe_id: friendly_name}
         raw = config.get("whitelisted_universes", {})
@@ -273,34 +526,225 @@ class WhitelistGuardian:
                 uid = int(key)
                 self.whitelist[uid] = str(val) if val else f"Universe {uid}"
             except (ValueError, TypeError):
-                pass  # skip comment entries
+                pass
 
-        self.logger = setup_logging(config.get("log_file", str(LOG_FILE)))
         self.running = True
         self._last_universe = None
+        self._violation_count = 0
+
+        # Warn about outdated cookie format (May 2026 changes)
+        self._check_cookie_format(config["roblosecurity_cookie"])
+
+        # Deprecation notice for old config fields.
+        deprecated_used = [k for k in (
+            "enforcement_mode", "parent_phone_numbers", "twilio_account_sid",
+            "twilio_auth_token", "twilio_from_number",
+        ) if k in config]
+        if deprecated_used:
+            self.logger.warning(
+                f"Config has deprecated field(s) {deprecated_used}; "
+                "they're ignored. The guardian now notifies via Telegram "
+                "(parent_chat_ids + telegram_bot_token). See README."
+            )
 
     def stop(self, *_):
         self.running = False
         self.logger.info("Shutting down guardian.")
 
+    @staticmethod
+    def _is_outdated_cookie(cookie: str) -> bool:
+        """
+        Check if a cookie matches the deprecated format that Roblox
+        began rejecting after May 1, 2026.
+
+        Outdated formats:
+          <Warning><Hex String>
+          <Warning>GgIQAQ.<Hex String>
+        """
+        warning = (
+            r"_\|WARNING:-DO-NOT-SHARE-THIS\.--Sharing-this-will-allow-"
+            r"someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-"
+            r"items\.\|_"
+        )
+        outdated_re = re.compile(
+            rf"^({warning})(GgIQAQ\.)?([0-9A-F]+)$"
+        )
+        return bool(outdated_re.match(cookie))
+
+    def _check_cookie_format(self, cookie: str):
+        """Warn at startup if the cookie uses a deprecated format."""
+        if self._is_outdated_cookie(cookie):
+            self.logger.warning(
+                "⚠  Your .ROBLOSECURITY cookie uses the OLD format "
+                "(deprecated May 2026). This will cause 401 errors."
+            )
+            self.logger.warning(
+                "   Fix: Log into roblox.com in a fresh browser session, "
+                "copy the new cookie from DevTools, and update the config."
+            )
+            self.logger.warning(
+                "   The new cookie format will look different from the "
+                "old hex-only format. The script will auto-rotate it "
+                "going forward once you provide a valid one."
+            )
+
+    def _child_label(self) -> str:
+        """Pick the most parent-friendly name to identify the child in
+        SMS bodies: explicit display name > Roblox username > user ID."""
+        return (
+            self.child_display_name
+            or self.account_name
+            or f"User {self.user_id}"
+        )
+
+    def _notify_parents_telegram(self, universe_id, last_location):
+        """
+        Send a violation Telegram message to every chat in
+        parent_chat_ids. Non-blocking on failure — one bad chat_id
+        doesn't stop the others.
+        """
+        if not self.parent_chat_ids:
+            self.logger.warning(
+                "   No parent_chat_ids configured — skipping Telegram. "
+                "Run '--list-chats' to discover chat IDs for each parent."
+            )
+            return
+        if not self.telegram_bot_token:
+            self.logger.warning(
+                "   Telegram bot token not configured — skipping. "
+                "Set telegram_bot_token in the config, or the "
+                "TELEGRAM_BOT_TOKEN env var."
+            )
+            return
+
+        child = self._child_label()
+        experience = last_location.strip() or f"Universe {universe_id}"
+        text = (
+            f"🚫 Roblox Guardian: {child} joined a non-whitelisted "
+            f'experience: "{experience}".'
+        )
+
+        sent = 0
+        for chat_id in self.parent_chat_ids:
+            ok = send_telegram_message(
+                self.telegram_bot_token, chat_id, text, self.logger
+            )
+            if ok:
+                sent += 1
+                self.logger.info(f"   ✓ Telegram sent to chat {chat_id}")
+        self.logger.info(
+            f"   Notified {sent}/{len(self.parent_chat_ids)} parent chat(s)."
+        )
+
+    def _enforce(self, universe_id, place_id, last_location):
+        """
+        Handle a non-whitelisted-game detection: log it, fire desktop
+        notification, Telegram every parent, and (optionally) kill the
+        local Roblox process. Roblox no longer permits programmatic
+        remote session invalidation so the parent must intervene — the
+        Telegram message gets them informed within seconds.
+        """
+        self._violation_count += 1
+
+        self.logger.warning(
+            f"🚫 BLOCKED — Non-whitelisted game detected "
+            f"(universe={universe_id}, place={place_id}, "
+            f"location=\"{last_location}\") "
+            f"[violation #{self._violation_count}]"
+        )
+
+        if self.notify:
+            send_notification(
+                "Roblox Guardian",
+                f"{self._child_label()} joined non-whitelisted "
+                f"\"{last_location or universe_id}\""
+            )
+
+        if self.dry_run:
+            self.logger.info(
+                "   [DRY-RUN] Would notify parents + kill local, skipping."
+            )
+            return
+
+        self._notify_parents_telegram(universe_id, last_location)
+
+        if self.kill_local_process:
+            killed = kill_roblox()
+            if killed:
+                self.logger.info(
+                    f"   ✓ Killed local Roblox process: "
+                    f"{', '.join(killed)}"
+                )
+            else:
+                self.logger.info(
+                    "   No local Roblox process found "
+                    "(child likely on another device)."
+                )
+
     def run(self):
         signal.signal(signal.SIGINT, self.stop)
         signal.signal(signal.SIGTERM, self.stop)
 
-        mode = "DRY-RUN" if self.dry_run else "ENFORCING"
-        self.logger.info(f"Guardian started [{mode}] — monitoring user {self.user_id}")
+        actions = ["TELEGRAM"] if self.parent_chat_ids else []
+        if self.kill_local_process:
+            actions.append("local-kill")
+        mode_label = "DRY-RUN" if self.dry_run else (
+            "+".join(actions) if actions else "DETECT-ONLY"
+        )
+        self.logger.info(
+            f"Guardian started [{mode_label}] — monitoring user {self.user_id}"
+        )
+        self.logger.info(
+            f"Parent Telegram chats: {len(self.parent_chat_ids)}"
+        )
+
+        # Fail loud if the cookie is dead — otherwise the script silently
+        # polls forever, because the Presence API returns 200 even unauth
+        # (just with userPresenceType=1/"Website" instead of real game data).
+        self.logger.info("Validating .ROBLOSECURITY cookie...")
+        try:
+            me = self.session.whoami()
+        except RuntimeError as e:
+            self.logger.error(f"Cookie validation failed: {e}")
+            self.logger.error(
+                "Cannot proceed. Run with --check for a full diagnostic."
+            )
+            return
+        if me is None:
+            self.logger.error("Cookie is INVALID (Roblox returned 401).")
+            self.logger.error(
+                "→ Grab a fresh .ROBLOSECURITY from DevTools and update "
+                "whitelist_config.json."
+            )
+            self.logger.error(
+                "→ Don't log into the account anywhere else after, or it "
+                "will be invalidated again."
+            )
+            return
+        self.account_name = me.get("name", "") or ""
+        self.logger.info(
+            f"Authenticated as {me.get('name')} (id={me.get('id')})"
+        )
+        if me.get("id") != self.user_id:
+            self.logger.warning(
+                f"Cookie belongs to user {me.get('id')} but config monitors "
+                f"{self.user_id}. Make sure this is intentional."
+            )
+
         self.logger.info(f"Whitelisted universes: {len(self.whitelist)}")
         for uid, name in self.whitelist.items():
             self.logger.info(f"  ✓ {uid} — {name}")
 
         if not self.whitelist:
-            self.logger.warning("⚠  Whitelist is EMPTY — ALL games will be blocked!")
+            self.logger.warning(
+                "⚠  Whitelist is EMPTY — ALL games will be blocked!"
+            )
 
         consecutive_errors = 0
 
         while self.running:
             try:
-                presence = get_presence(self.user_id, self.cookie)
+                presence = self.session.get_presence(self.user_id)
                 consecutive_errors = 0
 
                 presence_type = presence.get("userPresenceType", 0)
@@ -308,7 +752,14 @@ class WhitelistGuardian:
                 place_id = presence.get("placeId")
                 last_location = presence.get("lastLocation", "")
 
-                # presenceType: 0=offline, 1=online(website), 2=in-game, 3=in-studio
+                self.logger.debug(
+                    f"poll → type={presence_type} "
+                    f"({PRESENCE_TYPE_NAMES.get(presence_type, '?')}), "
+                    f"universe={universe_id}, place={place_id}, "
+                    f"location={last_location!r}"
+                )
+
+                # presenceType: 0=offline, 1=website, 2=in-game, 3=in-studio
                 if presence_type == 2 and universe_id:
                     if universe_id != self._last_universe:
                         self._last_universe = universe_id
@@ -320,27 +771,9 @@ class WhitelistGuardian:
                                 f"(universe={universe_id}, place={place_id})"
                             )
                         else:
-                            self.logger.warning(
-                                f"🚫 BLOCKED — Joined non-whitelisted game "
-                                f"(universe={universe_id}, place={place_id}, "
-                                f"location=\"{last_location}\")"
+                            self._enforce(
+                                universe_id, place_id, last_location
                             )
-                            if self.notify:
-                                send_notification(
-                                    "Roblox Guardian",
-                                    f"Blocked non-whitelisted game "
-                                    f"(Universe {universe_id})"
-                                )
-                            if self.auto_kill and not self.dry_run:
-                                killed = kill_roblox()
-                                if killed:
-                                    self.logger.info(
-                                        f"   Killed processes: {', '.join(killed)}"
-                                    )
-                                else:
-                                    self.logger.warning(
-                                        "   Could not find Roblox process to kill"
-                                    )
 
                 elif presence_type != 2:
                     if self._last_universe is not None:
@@ -352,10 +785,12 @@ class WhitelistGuardian:
                 self.logger.error(f"API error: {e}")
                 if consecutive_errors >= 5:
                     self.logger.error(
-                        "5 consecutive errors — check your cookie and network."
+                        "5 consecutive errors — cookie may be expired. "
+                        "Refresh it and restart."
                     )
-                    # Back off
-                    time.sleep(min(self.poll_interval * consecutive_errors, 60))
+                    time.sleep(
+                        min(self.poll_interval * consecutive_errors, 60)
+                    )
 
             except Exception as e:
                 consecutive_errors += 1
@@ -363,21 +798,36 @@ class WhitelistGuardian:
 
             time.sleep(self.poll_interval)
 
-        self.logger.info("Guardian stopped.")
+        self.logger.info(
+            f"Guardian stopped. Total violations blocked: "
+            f"{self._violation_count}"
+        )
 
 
 # ── Game lookup helper ───────────────────────────────────────────────────────
 
 def lookup_game(keyword: str, cookie: str = ""):
-    """Search for a Roblox game and print its Universe ID."""
+    """
+    Search for a Roblox game and print its Universe ID.
+
+    Uses the modern omni-search endpoint (apis.roblox.com/search-api/
+    omni-search). The legacy /v1/games/list?model.keyword endpoint was
+    removed by Roblox and now returns 404.
+
+    Two quirks of omni-search:
+      - It requires a non-browser-like response refusal unless a real
+        User-Agent header is set; otherwise it returns empty results.
+      - It requires a `sessionId` query parameter, but any non-empty
+        value works for one-off searches.
+    """
     print(f"\nSearching for: \"{keyword}\"\n")
 
-    # Try with the universe search API (public, no auth needed)
-    url = (f"https://games.roblox.com/v1/games/list?"
-           f"model.keyword={quote(keyword)}"
-           f"&model.startRows=0&model.maxRows=10")
+    url = (f"https://apis.roblox.com/search-api/omni-search?"
+           f"searchQuery={quote(keyword)}"
+           f"&pageType=all&sessionId=guardian-lookup")
     headers = {
         "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (RobloxWhitelistGuardian)",
     }
     if cookie and cookie != "PASTE_YOUR_COOKIE_HERE":
         headers["Cookie"] = f".ROBLOSECURITY={cookie}"
@@ -387,7 +837,15 @@ def lookup_game(keyword: str, cookie: str = ""):
     try:
         with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-            games = data.get("games", [])
+            # omni-search returns a list of result groups; each group
+            # has "contents" with the actual games. Flatten and keep
+            # only the Game-typed entries.
+            for group in data.get("searchResults", []):
+                if group.get("contentGroupType") != "Game":
+                    continue
+                for entry in group.get("contents", []):
+                    if entry.get("universeId"):
+                        games.append(entry)
     except Exception as e:
         print(f"  Search API error: {e}")
         print("  Try finding the Universe ID manually:")
@@ -416,6 +874,276 @@ def lookup_game(keyword: str, cookie: str = ""):
         print(f'  "{ex.get("universeId", "ID")}": "{ex.get("name", "Name")}"\n')
 
 
+def cmd_check(config: dict) -> int:
+    """
+    Preflight diagnostic: verify the cookie is valid and that Roblox is
+    reporting enough presence data for the guardian to actually work.
+    Run this BEFORE starting the daemon if things seem broken — it pins
+    down whether the problem is the cookie, the account's privacy
+    settings, or something else.
+    """
+    print("=" * 60)
+    print("Roblox Guardian — preflight check")
+    print("=" * 60)
+
+    user_id = config.get("roblox_user_id", 0)
+    cookie = config.get("roblosecurity_cookie", "")
+    if not user_id:
+        print("\n  ✗ No roblox_user_id set in config.\n")
+        return 1
+    if not cookie or cookie == "PASTE_YOUR_COOKIE_HERE":
+        print("\n  ✗ No .ROBLOSECURITY cookie set in config.\n")
+        return 1
+
+    session = RobloxSession(cookie)
+
+    # Report this machine's public egress IP. Roblox locks cookies
+    # to the IP region where they were issued (active since Mar 2022),
+    # so if you grabbed the cookie elsewhere this IP won't match and
+    # every authenticated call will 401 immediately.
+    try:
+        with urlopen("https://api.ipify.org?format=json", timeout=5) as r:
+            ip = json.loads(r.read().decode()).get("ip", "?")
+        print(f"\nThis machine's public IP: {ip}")
+        print("(Cookie must have been grabbed from a browser on an IP")
+        print(" in the same region as this one — Roblox 401s otherwise.)")
+    except Exception:
+        print("\n(Could not determine public IP. If you see a 401 below,")
+        print(" verify the cookie was grabbed from this same machine/network.)")
+
+    # 0. Cookie format (deprecated formats won't authenticate at all)
+    if WhitelistGuardian._is_outdated_cookie(cookie):
+        print()
+        print("  ✗ Cookie uses the OLD format (deprecated May 2026).")
+        print("    Roblox no longer accepts hex-only / GgIQAQ.<hex> cookies.")
+        print("    Grab a fresh cookie from a current browser session and")
+        print("    paste it into whitelist_config.json.\n")
+        return 1
+
+    # Track overall pass/fail but always continue so the SMS section
+    # gets reported even when the cookie or presence checks bail —
+    # fixing SMS config doesn't require an authenticated cookie.
+    exit_code = 0
+
+    # 1. Cookie validity
+    print("\n[1/2] Validating .ROBLOSECURITY cookie...")
+    me = None
+    try:
+        me = session.whoami()
+    except RuntimeError as e:
+        print(f"  ✗ Network/API error: {e}")
+        exit_code = 1
+    if me is None and exit_code == 0:
+        print("  ✗ Cookie is INVALID — Roblox returned 401.")
+        print("    Get a fresh cookie:")
+        print("    1. Log into the account in a fresh browser window.")
+        print("    2. DevTools (F12) → Application → Cookies → .ROBLOSECURITY")
+        print("    3. Paste the value into whitelist_config.json.")
+        print("    4. Don't log in elsewhere afterward — that invalidates it.")
+        exit_code = 1
+    elif me:
+        print(
+            f"  ✓ Cookie is valid. Authenticated as: "
+            f"{me.get('name')} (id={me.get('id')})"
+        )
+        if me.get("id") != user_id:
+            print(
+                f"  ⚠  Cookie belongs to user {me.get('id')} but config "
+                f"monitors {user_id}."
+            )
+            print("     Presence works for any user, but confirm this is intentional.")
+
+    # 2. Presence (skip if cookie failed)
+    print(f"\n[2/2] Fetching presence for user {user_id}...")
+    if me is None:
+        print("  · skipped (cookie invalid)")
+        _cmd_check_sms_section(config)
+        return exit_code
+    try:
+        p = session.get_presence(user_id)
+    except RuntimeError as e:
+        print(f"  ✗ Presence API error: {e}")
+        _cmd_check_sms_section(config)
+        return 1
+    pt = p.get("userPresenceType", 0)
+    print(f"  · presenceType: {pt} ({PRESENCE_TYPE_NAMES.get(pt, '?')})")
+    print(f"  · universeId:   {p.get('universeId')}")
+    print(f"  · placeId:      {p.get('placeId')}")
+    print(f"  · lastLocation: {p.get('lastLocation')!r}")
+
+    if pt == 2 and p.get("universeId"):
+        print("\n  ✓ Player is in-game — guardian can see the universe ID.")
+    elif pt == 2:
+        print("\n  ⚠  In-game flag set but universeId is null — unusual.")
+    else:
+        print()
+        print("  ⚠  Player is NOT reported as in-game.")
+        print("     If they ARE in a game right now (any device), the cause is")
+        print("     almost certainly the account's presence privacy setting:")
+        print("       Roblox → Settings → Privacy →")
+        print("       'Who can see my online status?' → set to 'Everyone'.")
+        print("     Without that, presence reports 'Website' even mid-game.")
+
+    _cmd_check_sms_section(config)
+    return exit_code
+
+
+def _cmd_check_sms_section(config: dict):
+    """Telegram-config part of the preflight, factored so we always
+    print it even if the cookie/presence checks bailed early."""
+    print(f"\n[Telegram] Notification configuration check...")
+    chat_ids = config.get("parent_chat_ids", []) or []
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN")
+             or config.get("telegram_bot_token", ""))
+    if not chat_ids:
+        print("  ⚠  parent_chat_ids is empty — no Telegram messages will be sent.")
+        print(f"     → After creating the bot, run "
+              f"'python {sys.argv[0]} --list-chats'")
+        print( "       and have each parent send /start to the bot.")
+    else:
+        print(f"  · {len(chat_ids)} parent chat(s) configured:")
+        for c in chat_ids:
+            print(f"      {c}")
+    if not token:
+        print("  ⚠  Telegram bot token not set.")
+        print( "     Create a bot via @BotFather in Telegram, then set")
+        print( "     telegram_bot_token in the config OR TELEGRAM_BOT_TOKEN env var.")
+    else:
+        # Token format is <bot_id>:<auth_token> — show only the bot_id half.
+        bot_id = token.split(":", 1)[0] if ":" in token else token[:8]
+        print(f"  ✓ Bot token present (bot_id={bot_id}).")
+        if chat_ids:
+            print(f"     → Run 'python {sys.argv[0]} --test-telegram' to "
+                  f"verify delivery.")
+    print()
+
+
+def cmd_test_telegram(config: dict) -> int:
+    """
+    Send a test Telegram message to every chat in parent_chat_ids so
+    the user can verify the bot token + recipient chat IDs work before
+    relying on the daemon to deliver during a real violation.
+    """
+    print("=" * 60)
+    print("Roblox Guardian — Telegram delivery test")
+    print("=" * 60)
+
+    chat_ids = config.get("parent_chat_ids", []) or []
+    if not chat_ids:
+        print("\n  ✗ No parent_chat_ids configured. Run --list-chats")
+        print("    to discover them after each parent has sent /start")
+        print("    to the bot.\n")
+        return 1
+
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN")
+             or config.get("telegram_bot_token", ""))
+    if not token:
+        print("\n  ✗ Telegram bot token not set.")
+        print("    Set telegram_bot_token in the config, or the")
+        print("    TELEGRAM_BOT_TOKEN env var. Token comes from")
+        print("    @BotFather when you create the bot.\n")
+        return 1
+
+    # Minimal stdout logger so send_telegram_message's error messages
+    # surface nicely without polluting guardian.log.
+    test_logger = logging.getLogger("guardian.tgtest")
+    if not test_logger.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(message)s"))
+        test_logger.addHandler(h)
+    test_logger.setLevel(logging.INFO)
+
+    child = (config.get("child_display_name", "")
+             or f"User {config.get('roblox_user_id', '?')}")
+    text = (
+        f"✅ Roblox Guardian test message for {child}. "
+        f"If you received this, Telegram notifications are wired up correctly."
+    )
+
+    print(f"\nSending test message to {len(chat_ids)} chat(s)...\n")
+    ok_count = 0
+    for cid in chat_ids:
+        ok = send_telegram_message(token, cid, text, test_logger)
+        status = "✓ sent" if ok else "✗ failed"
+        print(f"  {status}: chat {cid}")
+        if ok:
+            ok_count += 1
+    print(f"\n{ok_count}/{len(chat_ids)} test message(s) delivered.")
+    return 0 if ok_count == len(chat_ids) else 1
+
+
+def cmd_list_chats(config: dict) -> int:
+    """
+    Discover the Telegram chat IDs of parents who have messaged the
+    bot. Long-polls getUpdates for 60 seconds; each parent should send
+    any message to the bot (e.g. /start) while this is running. Prints
+    the unique chat IDs at the end so they can be pasted into
+    parent_chat_ids in the config.
+    """
+    print("=" * 60)
+    print("Roblox Guardian — Telegram chat ID discovery")
+    print("=" * 60)
+
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN")
+             or config.get("telegram_bot_token", ""))
+    if not token:
+        print("\n  ✗ Telegram bot token not set.")
+        print("    Create a bot via @BotFather in Telegram, paste the")
+        print("    token into telegram_bot_token (or TELEGRAM_BOT_TOKEN env),")
+        print("    then re-run this command.\n")
+        return 1
+
+    print("\nListening for the next 60 seconds.")
+    print("Each parent should now open Telegram, find the bot, and")
+    print("send any message (e.g. /start). Chat IDs will appear here.\n")
+
+    found: dict = {}   # chat_id → display name (first_name [last_name])
+
+    def absorb(updates):
+        new = False
+        last_update_id = None
+        for u in updates:
+            last_update_id = u.get("update_id")
+            msg = u.get("message") or u.get("edited_message") or {}
+            chat = msg.get("chat") or {}
+            cid = chat.get("id")
+            if cid is None:
+                continue
+            name_parts = [chat.get("first_name", ""),
+                          chat.get("last_name", "")]
+            label = " ".join(p for p in name_parts if p).strip() \
+                or chat.get("title") or chat.get("username") or "?"
+            if cid not in found:
+                found[cid] = label
+                print(f"  · chat_id={cid}  ({label})")
+                new = True
+        return last_update_id, new
+
+    deadline = time.time() + 60
+    offset = 0
+    while time.time() < deadline:
+        try:
+            updates = telegram_get_updates(token, offset=offset,
+                                           timeout_seconds=10)
+        except (HTTPError, URLError, RuntimeError) as e:
+            print(f"\n  ✗ Telegram API error: {e}")
+            return 1
+        last_id, _ = absorb(updates)
+        if last_id is not None:
+            offset = last_id + 1
+
+    print()
+    if not found:
+        print("  No chats received any messages in the window.")
+        print("  Make sure each parent sent /start to the bot while this")
+        print("  command was running, then try again.\n")
+        return 1
+
+    print(f"  Found {len(found)} chat(s). Add this to whitelist_config.json:\n")
+    print(f'    "parent_chat_ids": [{", ".join(str(c) for c in found)}]\n')
+    return 0
+
+
 def place_to_universe(place_id: int):
     """Convert a Place ID (from the URL) to a Universe ID."""
     url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
@@ -439,21 +1167,39 @@ def main():
     parser = argparse.ArgumentParser(
         description="Roblox Whitelist Guardian — parental control monitor"
     )
+    parser.add_argument("--config", type=str, metavar="PATH",
+                        help="Config file to use (default: whitelist_config.json "
+                             "next to the script). Use one config per child "
+                             "when monitoring multiple kids.")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Monitor and log but don't kill processes")
+                        help="Monitor and log but don't enforce")
     parser.add_argument("--lookup", type=str, metavar="GAME_NAME",
                         help="Search for a game's Universe ID")
     parser.add_argument("--place-to-universe", type=int, metavar="PLACE_ID",
                         help="Convert a Place ID to Universe ID")
     parser.add_argument("--init", action="store_true",
                         help="Create a default config file")
+    parser.add_argument("--check", action="store_true",
+                        help="Run preflight diagnostics (cookie + Telegram config) and exit")
+    parser.add_argument("--test-telegram", action="store_true",
+                        help="Send a test message to every parent_chat_ids entry and exit")
+    parser.add_argument("--list-chats", action="store_true",
+                        help="Long-poll the bot for 60s to discover parent chat IDs and exit")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable DEBUG logging (logs every poll's raw presence data)")
     args = parser.parse_args()
+
+    # Resolve config path: --config overrides the default. All subcommands
+    # honor this, so you can have e.g. emma.json + jacob.json side by side
+    # and run two daemon instances (one per kid) with different --config
+    # values plus a shared TELEGRAM_BOT_TOKEN env var.
+    config_path = Path(args.config) if args.config else CONFIG_FILE
 
     # ── Lookup mode
     if args.lookup:
         cookie = ""
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE) as f:
+        if config_path.exists():
+            with open(config_path) as f:
                 cfg = json.load(f)
             cookie = cfg.get("roblosecurity_cookie", "")
         lookup_game(args.lookup, cookie)
@@ -466,23 +1212,38 @@ def main():
 
     # ── Init mode
     if args.init:
-        if CONFIG_FILE.exists():
-            print(f"Config already exists: {CONFIG_FILE}")
+        if config_path.exists():
+            print(f"Config already exists: {config_path}")
             return
-        with open(CONFIG_FILE, "w") as f:
+        with open(config_path, "w") as f:
             json.dump(DEFAULT_CONFIG, f, indent=2)
-        print(f"Created config: {CONFIG_FILE}")
+        print(f"Created config: {config_path}")
         print("Edit it with your child's User ID, cookie, and whitelisted games.")
         return
 
     # ── Monitor mode
-    if not CONFIG_FILE.exists():
-        print(f"No config file found at {CONFIG_FILE}")
-        print(f"Run:  python {sys.argv[0]} --init")
+    if not config_path.exists():
+        print(f"No config file found at {config_path}")
+        if args.config:
+            print(f"Run:  python {sys.argv[0]} --config {args.config} --init")
+        else:
+            print(f"Run:  python {sys.argv[0]} --init")
         sys.exit(1)
 
-    with open(CONFIG_FILE) as f:
+    with open(config_path) as f:
         config = json.load(f)
+
+    # ── Preflight diagnostic
+    if args.check:
+        sys.exit(cmd_check(config))
+
+    # ── Test Telegram delivery
+    if args.test_telegram:
+        sys.exit(cmd_test_telegram(config))
+
+    # ── Discover Telegram chat IDs
+    if args.list_chats:
+        sys.exit(cmd_list_chats(config))
 
     if config.get("roblox_user_id", 0) == 0:
         print("ERROR: Set your child's roblox_user_id in the config file.")
@@ -495,7 +1256,8 @@ def main():
         print("  3. Copy the value into the config file")
         sys.exit(1)
 
-    guardian = WhitelistGuardian(config, dry_run=args.dry_run)
+    guardian = WhitelistGuardian(config, dry_run=args.dry_run,
+                                 debug=args.debug, config_path=config_path)
     guardian.run()
 
 
