@@ -148,6 +148,11 @@ write_unit() {
 Description=Roblox Whitelist Guardian for %i
 After=network-online.target
 Wants=network-online.target
+# Give up after 5 restart attempts inside 10 minutes. Combined with
+# the in-process auth backoff in the Python daemon, a hard crash loop
+# will surface as a failed unit instead of hammering Roblox forever.
+StartLimitBurst=5
+StartLimitIntervalSec=600
 
 [Service]
 Type=simple
@@ -155,8 +160,17 @@ User=$RUN_AS_USER
 WorkingDirectory=$SCRIPT_DIR
 EnvironmentFile=-$ENV_FILE
 ExecStart=$PYTHON3 $GUARDIAN_PY --config $SCRIPT_DIR/%i.json
+# RestartSec=10 was the old default; it caused a hot loop against
+# Roblox's auth endpoint when cookies went 401 (the daemon used to
+# exit on 401; now it sleeps in-process, but we still want a sane
+# floor in case the daemon crashes for other reasons). 60s + step
+# growth up to 15 min keeps the worst case gentle.
 Restart=always
-RestartSec=10
+RestartSec=60
+# Exponential restart backoff — requires systemd >= 254. Older
+# systemd silently ignores unknown keys, so leaving them in is safe.
+RestartSteps=5
+RestartMaxDelaySec=900
 
 # Conservative hardening — restrict the daemon's filesystem access
 # without breaking its need to read configs and write logs in

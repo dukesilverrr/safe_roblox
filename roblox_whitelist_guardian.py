@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import platform
+import random
 import re
 import signal
 import subprocess
@@ -57,6 +58,13 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from urllib.parse import quote
 
+# Backoff schedule (seconds) used whenever Roblox returns 401 — either at
+# startup or mid-session. Long, capped, with jitter applied at use-site.
+# The point is to stop hammering Roblox's auth endpoint while the cookie
+# is dead; aggressive retry from a single IP is what gets cookies
+# auto-invalidated in the first place.
+AUTH_BACKOFF_STEPS = (5 * 60, 15 * 60, 30 * 60, 60 * 60)
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 CONFIG_FILE = Path(__file__).parent / "whitelist_config.json"
@@ -65,7 +73,11 @@ DEFAULT_WHITELIST_FILENAME = "whitelist_universes.json"
 DEFAULT_CONFIG = {
     "roblox_user_id": 0,
     "roblosecurity_cookie": "PASTE_YOUR_COOKIE_HERE",
-    "poll_interval_seconds": 5,
+    # 10s is conservative — with N kid daemons polling the Presence API
+    # against a single shared IP, sub-5s intervals tend to get cookies
+    # invalidated by Roblox's anti-abuse. Lower it if you only run one
+    # daemon and want faster reaction time.
+    "poll_interval_seconds": 10,
     "notify_parent": True,
     "child_display_name": "",
     "telegram_bot_token": "",
@@ -107,24 +119,67 @@ def setup_logging(log_path: str, debug: bool = False) -> logging.Logger:
 
 # ── Whitelist loading ────────────────────────────────────────────────────────
 
-def load_whitelist(config: dict, config_path: Path,
-                   logger: logging.Logger = None) -> dict:
+def _parse_whitelist_dict(raw: dict) -> dict:
     """
-    Resolve the universe whitelist for a kid's config and return a
-    {int(universe_id): str(friendly_name)} map.
+    Turn a raw JSON dict ({str_id: name}) into the int-keyed whitelist
+    the guardian uses. Keys that don't parse as int (e.g. `"# Example"`
+    comment-style entries) are silently dropped — useful for inline
+    documentation inside the JSON file.
+    """
+    result: dict = {}
+    for key, val in raw.items():
+        try:
+            uid = int(key)
+            result[uid] = str(val) if val else f"Universe {uid}"
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def _read_whitelist_file(wl_path: Path) -> dict:
+    """
+    Read and parse a whitelist JSON file. Raises RuntimeError on missing,
+    malformed, or wrong-type contents. Shared between initial load and
+    hot-reload so behavior matches in both cases.
+    """
+    try:
+        with open(wl_path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"whitelist_file not found: {wl_path}. Create it with "
+            f"--init or point whitelist_file at an existing JSON map."
+        )
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"whitelist_file {wl_path} is not valid JSON: {e}"
+        )
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"whitelist_file {wl_path} must contain a JSON object "
+            f"of universe_id → name, got {type(raw).__name__}."
+        )
+    return _parse_whitelist_dict(raw)
+
+
+def load_whitelist(config: dict, config_path: Path,
+                   logger: logging.Logger = None):
+    """
+    Resolve the universe whitelist for a kid's config. Returns a tuple
+    of (whitelist_dict, source_path_or_None).
+
+    The source path is the resolved file path when `whitelist_file` is
+    set, or None for inline `whitelisted_universes` configs. The
+    guardian uses it to watch for mtime changes and hot-reload added
+    games without a restart.
 
     Source priority:
       1. `whitelist_file` — path to a JSON file containing the whitelist
-         map directly (top-level keys ARE the universe IDs). This is the
-         recommended form when running multiple kids — point each kid's
-         config at the same shared whitelist file. Relative paths
-         resolve next to the kid's config file.
+         map directly (top-level keys ARE the universe IDs). Recommended
+         when running multiple kids — point each kid's config at the same
+         shared file. Relative paths resolve next to the kid's config.
       2. Inline `whitelisted_universes` dict in the kid's config
          (backward compat). If both are set, file wins with a warning.
-
-    Keys that don't parse as int (e.g. `"# Example"` comment-style
-    entries) are silently skipped — useful for inline documentation
-    inside the JSON.
 
     Raises RuntimeError if `whitelist_file` is set but unreadable —
     we'd rather fail loud than silently allow every game.
@@ -141,37 +196,12 @@ def load_whitelist(config: dict, config_path: Path,
         wl_path = Path(wl_file)
         if not wl_path.is_absolute():
             wl_path = Path(config_path).parent / wl_path
-        try:
-            with open(wl_path) as f:
-                raw = json.load(f)
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"whitelist_file not found: {wl_path}. Create it with "
-                f"--init or point whitelist_file at an existing JSON map."
-            )
-        except json.JSONDecodeError as e:
-            raise RuntimeError(
-                f"whitelist_file {wl_path} is not valid JSON: {e}"
-            )
-        if not isinstance(raw, dict):
-            raise RuntimeError(
-                f"whitelist_file {wl_path} must contain a JSON object "
-                f"of universe_id → name, got {type(raw).__name__}."
-            )
-    elif inline is not None:
-        raw = inline
-    else:
-        raw = {}
+        return _read_whitelist_file(wl_path), wl_path
 
-    result: dict = {}
-    for key, val in raw.items():
-        try:
-            uid = int(key)
-            result[uid] = str(val) if val else f"Universe {uid}"
-        except (ValueError, TypeError):
-            # Comment-style keys ("# Example...") fall here. Drop them.
-            pass
-    return result
+    if inline is not None:
+        return _parse_whitelist_dict(inline), None
+
+    return {}, None
 
 
 # ── Roblox API helpers ───────────────────────────────────────────────────────
@@ -230,16 +260,41 @@ class RobloxSession:
         persist to config. This is REQUIRED since the May 2026 changes —
         Roblox rotates cookies opportunistically on any response, not
         only on logout-and-reauth.
+
+        Defensively reject anything that doesn't look like a real cookie
+        (logout responses can carry `.ROBLOSECURITY=deleted; Expires=...`
+        or similar invalidation sentinels — saving those would clobber
+        the user's working cookie with garbage).
         """
         new_cookie = self._extract_cookie(headers)
-        if new_cookie and new_cookie != self.cookie:
-            old_prefix = self.cookie[:20]
-            self.cookie = new_cookie
-            self._save_cookie(new_cookie)
-            self.logger.info(
-                f"🔑 Cookie rotated by Roblox "
-                f"({old_prefix}... → {new_cookie[:20]}...)"
+        if not new_cookie or new_cookie == self.cookie:
+            return
+        if not self._looks_like_real_cookie(new_cookie):
+            self.logger.debug(
+                f"Ignoring suspect Set-Cookie value "
+                f"(len={len(new_cookie)}, prefix={new_cookie[:20]!r}) — "
+                f"likely a logout sentinel, not a rotation."
             )
+            return
+        old_prefix = self.cookie[:20]
+        self.cookie = new_cookie
+        self._save_cookie(new_cookie)
+        self.logger.info(
+            f"🔑 Cookie rotated by Roblox "
+            f"({old_prefix}... → {new_cookie[:20]}...)"
+        )
+
+    @staticmethod
+    def _looks_like_real_cookie(value: str) -> bool:
+        """
+        A real .ROBLOSECURITY is hundreds of characters long and starts
+        with the WARNING preamble Roblox embeds in every issued cookie.
+        Logout/invalidation sentinels (`deleted`, empty, `""`, short
+        opaque blobs) all fail this check.
+        """
+        if not value or len(value) < 100:
+            return False
+        return "WARNING" in value
 
     def request(self, url: str, method: str = "GET",
                 data: dict = None, retry_csrf: bool = True) -> dict:
@@ -598,9 +653,17 @@ class WhitelistGuardian:
         # inline). load_whitelist will raise if the referenced file is
         # missing or malformed — that's intentional; the daemon should
         # not silently allow everything if its whitelist is broken.
-        self.whitelist: dict[int, str] = load_whitelist(
+        # The source path (if any) is kept so the main loop can watch
+        # it for mtime changes and hot-reload added games without a
+        # daemon restart.
+        self.whitelist: dict[int, str]
+        self.whitelist, self._whitelist_path = load_whitelist(
             config, self.config_path, self.logger
         )
+        self._whitelist_mtime = self._stat_whitelist_mtime()
+        # Track the mtime of the last failed reload so we only log the
+        # error once per mid-edit save, not on every poll thereafter.
+        self._whitelist_failed_mtime = None
 
         self.running = True
         self._last_universe = None
@@ -624,6 +687,174 @@ class WhitelistGuardian:
     def stop(self, *_):
         self.running = False
         self.logger.info("Shutting down guardian.")
+
+    def _interruptible_sleep(self, seconds: float):
+        """
+        Sleep up to `seconds`, but wake every second to check self.running
+        so SIGTERM/SIGINT during a long auth backoff exits within ~1s
+        rather than waiting out the full delay.
+        """
+        deadline = time.monotonic() + max(0.0, seconds)
+        while self.running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(1.0, remaining))
+
+    @staticmethod
+    def _is_auth_error(exc: BaseException) -> bool:
+        """
+        Detect a 401-shaped RuntimeError raised by RobloxSession.request().
+        The message is f"Roblox API {code} @ {url}: ..." so a substring
+        match on " 401 " is the cleanest test without restructuring the
+        exception class hierarchy.
+        """
+        return " 401 " in f" {exc} "
+
+    def _auth_backoff_seconds(self, attempt: int) -> float:
+        """
+        Pick the next auth-backoff delay. Saturates at the last step and
+        applies ±20% jitter so multiple daemons that fall into 401 at
+        once don't all wake at the same instant and re-hammer.
+        """
+        step = AUTH_BACKOFF_STEPS[min(attempt, len(AUTH_BACKOFF_STEPS) - 1)]
+        return step * random.uniform(0.8, 1.2)
+
+    def _stat_whitelist_mtime(self):
+        """
+        Return the whitelist file's current mtime, or None if it's not
+        a file-backed whitelist (inline configs) or the file is gone.
+        """
+        if not self._whitelist_path:
+            return None
+        try:
+            return self._whitelist_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _maybe_reload_whitelist(self):
+        """
+        If the whitelist file's mtime has changed since we last loaded
+        it, re-parse it and atomically swap in the new map. Log added/
+        removed universes so the change is auditable.
+
+        On parse error (file is mid-edit and not yet valid JSON), keep
+        the in-memory whitelist intact and log a single warning per
+        bad-mtime — we don't want to spam the log every 10s while the
+        user is composing a multi-line edit.
+
+        No-op for inline whitelists (no file to watch).
+        """
+        if not self._whitelist_path:
+            return
+        current_mtime = self._stat_whitelist_mtime()
+        if current_mtime is None or current_mtime == self._whitelist_mtime:
+            return
+
+        try:
+            new_wl = _read_whitelist_file(self._whitelist_path)
+        except RuntimeError as e:
+            if self._whitelist_failed_mtime != current_mtime:
+                self.logger.warning(
+                    f"Whitelist reload failed (keeping previous): {e}"
+                )
+                self._whitelist_failed_mtime = current_mtime
+            return
+
+        added = sorted(set(new_wl) - set(self.whitelist))
+        removed = sorted(set(self.whitelist) - set(new_wl))
+        if not added and not removed:
+            # File touched but contents unchanged (rename/save no-op).
+            # Bump the mtime so we don't keep re-reading.
+            self._whitelist_mtime = current_mtime
+            return
+
+        self.whitelist = new_wl
+        self._whitelist_mtime = current_mtime
+        self._whitelist_failed_mtime = None
+
+        self.logger.info(
+            f"🔄 Whitelist reloaded: +{len(added)} / -{len(removed)} "
+            f"({len(self.whitelist)} total)"
+        )
+        for uid in added:
+            self.logger.info(f"  + {uid} — {self.whitelist[uid]}")
+        for uid in removed:
+            # We no longer have the friendly name; log just the ID.
+            self.logger.info(f"  - {uid}")
+
+    def _reload_cookie_from_disk(self):
+        """
+        Pick up a fresh .ROBLOSECURITY value the user may have edited
+        into the config while we were sleeping in auth backoff. Without
+        this, a user updating the cookie wouldn't take effect until the
+        daemon was restarted — defeating the whole point of staying
+        running through a 401 storm.
+        """
+        try:
+            with open(self.config_path) as f:
+                disk_cfg = json.load(f)
+            disk_cookie = disk_cfg.get("roblosecurity_cookie", "")
+            if disk_cookie and disk_cookie != self.session.cookie:
+                self.logger.info(
+                    "Detected updated cookie on disk; loading fresh value."
+                )
+                self.session.cookie = disk_cookie
+        except Exception as e:
+            self.logger.debug(f"Could not re-read config for cookie: {e}")
+
+    def _auth_loop(self, start_attempt: int = 0):
+        """
+        Validate the cookie via whoami(), retrying with long backoff on
+        401 or network errors. Returns the user dict on success, or None
+        if the daemon was asked to stop during backoff.
+
+        Crucially this does NOT exit the process on 401 — systemd would
+        restart us in ~60s and we'd hammer Roblox's auth endpoint with
+        a dead cookie. Sleeping in-process for minutes-to-an-hour gives
+        the human time to grab a fresh cookie (or for Roblox to stop
+        being upset with the IP) without flooding their servers.
+        """
+        attempt = start_attempt
+        while self.running:
+            # Each retry re-reads the cookie from disk in case the user
+            # pasted a fresh one in while we were sleeping.
+            self._reload_cookie_from_disk()
+            try:
+                me = self.session.whoami()
+            except RuntimeError as e:
+                delay = self._auth_backoff_seconds(attempt)
+                self.logger.error(
+                    f"whoami network/API error: {e}. "
+                    f"Sleeping {delay/60:.1f} min before retry."
+                )
+                self._interruptible_sleep(delay)
+                attempt += 1
+                continue
+
+            if me is None:
+                delay = self._auth_backoff_seconds(attempt)
+                self.logger.error(
+                    "Cookie is INVALID (Roblox returned 401)."
+                )
+                if attempt == 0:
+                    self.logger.error(
+                        "→ Grab a fresh .ROBLOSECURITY from DevTools and "
+                        "update the config file."
+                    )
+                    self.logger.error(
+                        "→ The daemon will NOT exit; it'll keep re-checking "
+                        "with long backoff so it doesn't hammer Roblox."
+                    )
+                self.logger.error(
+                    f"Sleeping {delay/60:.1f} min before re-checking cookie."
+                )
+                self._interruptible_sleep(delay)
+                attempt += 1
+                continue
+
+            return me
+        return None
 
     @staticmethod
     def _is_outdated_cookie(cookie: str) -> bool:
@@ -772,29 +1003,30 @@ class WhitelistGuardian:
             f"Parent Telegram chats: {len(self.parent_chat_ids)}"
         )
 
-        # Fail loud if the cookie is dead — otherwise the script silently
-        # polls forever, because the Presence API returns 200 even unauth
-        # (just with userPresenceType=1/"Website" instead of real game data).
+        # When systemd batch-starts N kid daemons together, they'd
+        # otherwise all hit Roblox in the same second. A small random
+        # delay desynchronises them; ±0–10s is plenty given a 10s+
+        # steady-state poll interval.
+        jitter = random.uniform(0, 10)
+        self.logger.info(f"Startup jitter: sleeping {jitter:.1f}s")
+        self._interruptible_sleep(jitter)
+        if not self.running:
+            return
+
+        # Validate cookie. _auth_loop sleeps in-process with long
+        # backoff on 401 rather than letting the daemon exit — exiting
+        # means systemd respawns us in ~60s and we hammer
+        # /users/authenticated with a dead cookie, which is exactly
+        # what makes Roblox roll cookies in the first place.
         self.logger.info("Validating .ROBLOSECURITY cookie...")
-        try:
-            me = self.session.whoami()
-        except RuntimeError as e:
-            self.logger.error(f"Cookie validation failed: {e}")
-            self.logger.error(
-                "Cannot proceed. Run with --check for a full diagnostic."
-            )
-            return
+        me = self._auth_loop()
         if me is None:
-            self.logger.error("Cookie is INVALID (Roblox returned 401).")
-            self.logger.error(
-                "→ Grab a fresh .ROBLOSECURITY from DevTools and update "
-                "whitelist_config.json."
-            )
-            self.logger.error(
-                "→ Don't log into the account anywhere else after, or it "
-                "will be invalidated again."
+            self.logger.info(
+                f"Guardian stopped. Total violations blocked: "
+                f"{self._violation_count}"
             )
             return
+
         self.account_name = me.get("name", "") or ""
         self.logger.info(
             f"Authenticated as {me.get('name')} (id={me.get('id')})"
@@ -815,11 +1047,17 @@ class WhitelistGuardian:
             )
 
         consecutive_errors = 0
+        auth_backoff_attempt = 0
 
         while self.running:
+            # Cheap stat() — picks up edits to whitelist_universes.json
+            # within one poll cycle, no daemon restart needed.
+            self._maybe_reload_whitelist()
+
             try:
                 presence = self.session.get_presence(self.user_id)
                 consecutive_errors = 0
+                auth_backoff_attempt = 0
 
                 presence_type = presence.get("userPresenceType", 0)
                 universe_id = presence.get("universeId")
@@ -855,14 +1093,34 @@ class WhitelistGuardian:
                         self._last_universe = None
 
             except RuntimeError as e:
+                # A mid-session 401 means the cookie just went dead.
+                # Re-validate via the same long-backoff auth loop instead
+                # of churning poll cycles against an endpoint that's
+                # already saying no.
+                if self._is_auth_error(e):
+                    self.logger.error(
+                        f"Mid-session 401 — cookie invalidated. {e}"
+                    )
+                    me = self._auth_loop(start_attempt=auth_backoff_attempt)
+                    auth_backoff_attempt += 1
+                    if me is None:
+                        break
+                    self.account_name = me.get("name", "") or ""
+                    self.logger.info(
+                        f"Cookie re-validated after 401: {me.get('name')}"
+                    )
+                    consecutive_errors = 0
+                    # _auth_loop already slept; skip the bottom sleep.
+                    continue
+
                 consecutive_errors += 1
                 self.logger.error(f"API error: {e}")
                 if consecutive_errors >= 5:
                     self.logger.error(
-                        "5 consecutive errors — cookie may be expired. "
-                        "Refresh it and restart."
+                        f"{consecutive_errors} consecutive transient "
+                        f"errors — extra backoff."
                     )
-                    time.sleep(
+                    self._interruptible_sleep(
                         min(self.poll_interval * consecutive_errors, 60)
                     )
 
@@ -870,7 +1128,7 @@ class WhitelistGuardian:
                 consecutive_errors += 1
                 self.logger.error(f"Unexpected error: {e}")
 
-            time.sleep(self.poll_interval)
+            self._interruptible_sleep(self.poll_interval)
 
         self.logger.info(
             f"Guardian stopped. Total violations blocked: "

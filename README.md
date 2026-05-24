@@ -12,7 +12,7 @@ no carrier hassles); parents just need the Telegram app installed.
 
 ---
 
-## Why "detection + SMS" and not auto-kick?
+## Why "detection + Telegram" and not auto-kick?
 
 Earlier versions of this script tried to programmatically invalidate the
 child's Roblox session ("kick them out remotely"). Roblox has since
@@ -23,7 +23,7 @@ for everyone.
 
 What still works reliably:
 - **Detection**: the Presence API tells us exactly what game the kid is in.
-- **Notification**: Twilio SMS reaches the parent within seconds.
+- **Notification**: Telegram reaches the parent within seconds, for free.
 
 The parent then takes the device, talks to the kid, or whatever's
 appropriate. This is more intervention than the script can do alone, but
@@ -68,6 +68,14 @@ The number (`123456789`) is their User ID.
 > automatically. You don't need to manually refresh unless the cookie
 > has been invalidated externally (password change, login elsewhere,
 > or an outdated-format cookie that the server refuses).
+
+> **If the cookie does go 401**, the daemon does **not** exit. It sleeps
+> in-process with long backoff (5 → 15 → 30 → 60 min, capped) and
+> re-validates. This is deliberate: exiting + systemd respawning every
+> few seconds against a dead cookie is exactly what gets Roblox's
+> anti-abuse to start invalidating *more* cookies. When you paste a
+> fresh cookie into the config file, the daemon picks it up at the next
+> backoff wake — **no restart needed**.
 
 ### 2a. Open up presence privacy on the account
 
@@ -137,7 +145,7 @@ creates both files.
 {
   "roblox_user_id": 123456789,
   "roblosecurity_cookie": "_|WARNING:-DO-NOT-SHARE-THIS...",
-  "poll_interval_seconds": 5,
+  "poll_interval_seconds": 10,
   "notify_parent": true,
 
   "child_display_name": "Emma",
@@ -167,6 +175,12 @@ script from. An absolute path works too.
 
 If the file is missing or malformed, the daemon refuses to start
 rather than silently allowing everything.
+
+> **Hot reload**: every poll, the daemon stats `whitelist_universes.json`
+> and reloads it if the mtime changed. Add a new game to the file and
+> every running daemon picks it up within one poll cycle — no restarts.
+> Mid-edit malformed JSON is handled gracefully: the in-memory whitelist
+> stays in effect and a single warning is logged per bad save.
 
 > **Where do logs go?** The log file path is derived from the config
 > filename: `whitelist_config.json` → `whitelist_config.log`,
@@ -313,18 +327,33 @@ for every kid.
 # /etc/systemd/system/roblox-guardian@.service
 [Unit]
 Description=Roblox Whitelist Guardian for %i
-After=network.target
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=600
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /path/to/roblox_whitelist_guardian.py --config /path/to/%i.json
 Environment=TELEGRAM_BOT_TOKEN=123456789:ABC-DEF...
 Restart=always
-RestartSec=10
+RestartSec=60
+RestartSteps=5
+RestartMaxDelaySec=900
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+> **Why `RestartSec=60` and not 10?** A `RestartSec=10` setting will
+> respawn the daemon every 10 seconds against Roblox's auth endpoint
+> if the cookie is dead — and the daemon's own auth backoff can't kick
+> in if systemd keeps killing-and-relaunching it. The Python daemon
+> handles auth failures itself (sleeps in-process for many minutes),
+> so the systemd restart timer only needs to cover hard crashes,
+> which are rare. The `RestartSteps`/`RestartMaxDelaySec` keys provide
+> exponential backoff if a crash loop does occur (requires systemd ≥254;
+> older versions silently ignore them).
 
 Then enable and start one instance per kid:
 
@@ -412,6 +441,8 @@ looks like this:
 Description=Roblox Whitelist Guardian for %i
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=600
 
 [Service]
 Type=simple
@@ -420,7 +451,9 @@ WorkingDirectory=<repo-dir>
 EnvironmentFile=-<repo-dir>/.env
 ExecStart=/usr/bin/python3 <repo-dir>/roblox_whitelist_guardian.py --config <repo-dir>/%i.json
 Restart=always
-RestartSec=10
+RestartSec=60
+RestartSteps=5
+RestartMaxDelaySec=900
 NoNewPrivileges=true
 PrivateTmp=true
 
@@ -443,7 +476,7 @@ cookie was grabbed from (see Troubleshooting).
 |---|---|---|
 | `roblox_user_id` | — | Your child's numeric Roblox user ID |
 | `roblosecurity_cookie` | — | Auth cookie (auto-rotated on every response) |
-| `poll_interval_seconds` | `5` | How often to check (seconds) |
+| `poll_interval_seconds` | `10` | How often to check (seconds). Sub-5s intervals across multiple daemons on one IP tend to get cookies invalidated by Roblox's anti-abuse — leave at 10+ unless you only run one daemon and want faster reaction time. |
 | `notify_parent` | `true` | Desktop notification on the daemon's machine |
 | `child_display_name` | `""` | Friendly name used in Telegram bodies (e.g. `"Emma"`). Falls back to Roblox username. |
 | `telegram_bot_token` | `""` | Token from @BotFather. Env: `TELEGRAM_BOT_TOKEN` (preferred). |
@@ -533,6 +566,29 @@ The guardian auto-rotates cookies on every API response and writes the
 new value back to `whitelist_config.json`, so once you're past the
 initial 401, manual refreshes should be rare.
 
+### "My cookies keep getting invalidated every few hours"
+
+This usually means Roblox's anti-abuse has flagged your IP. The two
+biggest causes:
+
+1. **The daemon was respawning every ~10s against a dead cookie**
+   (older `install-service.sh` had `RestartSec=10` and the daemon
+   exited on 401). Result: hundreds of 401s/hour to
+   `users.roblox.com/v1/users/authenticated` from one IP, which Roblox
+   responds to by aggressively rotating cookies. **Fix:** re-run
+   `sudo ./install-service.sh install` to pick up the new
+   `RestartSec=60` + in-process auth backoff. The daemon now sleeps
+   5–60 min between auth retries on 401 instead of exiting.
+
+2. **Poll interval too low across multiple daemons.** Six daemons
+   polling every 3 seconds = ~2 req/s steady-state from one IP, which
+   can also trip anti-abuse. Set `poll_interval_seconds` to **10** or
+   higher in every config when running multiple kids.
+
+After making these changes, give Roblox an hour or two to forget your
+IP, then grab one fresh cookie. The auto-rotation should hold it
+indefinitely.
+
 ### "Why doesn't the guardian kick the kid out automatically?"
 
 It used to try. Roblox removed the ability — programmatic session
@@ -542,8 +598,8 @@ invalidation (`signoutfromallsessionsandreauthenticate`,
 browser login flow. No cookie-only API client can obtain one, regardless
 of which library you use. The script consequently focuses on **detection
 and parent notification** instead — within seconds of the kid joining a
-non-whitelisted game, every number in `parent_phone_numbers` gets an SMS
-naming the child and the experience. You intervene manually.
+non-whitelisted game, every chat in `parent_chat_ids` gets a Telegram
+message naming the child and the experience. You intervene manually.
 
 ### "Telegram messages aren't arriving"
 
@@ -589,11 +645,16 @@ After that the guardian's auto-rotation will keep it current.
 - **Cookie expiration**: cookies auto-rotate on every API response, so
   the script self-heals against routine rotations. If you still see
   repeated 401s, the cookie was invalidated externally (password change,
-  login from another device, etc.) — grab a fresh one.
+  login from another device, etc.) — grab a fresh one and paste it into
+  the config. The daemon doesn't need to be restarted; it'll reload the
+  cookie at the next auth-backoff wake (worst case ~1 hour).
 - **Polling gap**: there's a `poll_interval_seconds` window where the
   child could briefly be in a non-whitelisted game before the parent
-  is notified. Reduce to 2-3 for tighter latency at the cost of slightly
-  more API traffic.
+  is notified. **Don't go below ~10s when running multiple daemons** —
+  sub-5s polling across N kids has, in testing, been enough for Roblox's
+  anti-abuse to start invalidating cookies on the shared IP. 10s is the
+  sweet spot for a typical multi-kid household; if you're only running
+  one daemon, you can lower it.
 - **Re-joining**: after the parent intervenes, the child can try to
   rejoin. The guardian will detect and re-notify on the next poll cycle.
   Persistent re-joining gets logged with a violation counter.
