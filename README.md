@@ -49,7 +49,15 @@ The number (`123456789`) is their User ID.
 
 ### 2. Get the .ROBLOSECURITY cookie
 
-1. Log into your child's Roblox account in a web browser.
+> 💡 **If you're monitoring multiple kids, read [Recommended: one
+> dedicated parent-account cookie](#recommended-one-dedicated-parent-account-cookie)
+> first.** Using each kid's own cookie tends to die within hours
+> because the kid's own device activity invalidates it. The
+> parent-account pattern fixes that.
+
+1. Log into the account in a web browser. (For a single kid you can
+   use the kid's own account; for multi-kid use a dedicated bot
+   account — see the link above.)
 2. Open DevTools: press **F12** (or Cmd+Option+I on Mac).
 3. Go to **Application** → **Cookies** → `https://www.roblox.com`.
 4. Find `.ROBLOSECURITY` and copy the full value.
@@ -255,6 +263,64 @@ Roblox process when a violation fires. Set in the config:
 This is **independent of SMS** — both fire if both are configured. On
 iOS / Android / Xbox, the local kill is a no-op, so it's only worth
 enabling if the daemon is on the actual play machine.
+
+---
+
+## Recommended: one dedicated parent-account cookie
+
+The Roblox Presence API accepts any user ID as long as the requesting
+session is *some* valid Roblox login. The cookie does **not** have to
+belong to the kid being monitored — and using the kid's own cookie is
+actually a bad idea when the kid plays on their own devices.
+
+**Why the kid's own cookie keeps dying:**
+
+When you grab the cookie from your browser, you and the kid now both
+hold sessions on the same account. Every time the kid opens Roblox on
+their iPad/phone, their device authenticates and may invalidate your
+daemon's session as a side effect. In testing, kids' own-account
+cookies died on rolling schedules tracking each kid's usage pattern
+(morning device pickup, mid-day play, bedtime), not from anti-abuse
+or the polling rate.
+
+**The fix:**
+
+1. Create one new Roblox account — e.g. `RyanGuardianBot`. Don't friend
+   anyone, don't customize it. It's a passive observer.
+2. Grab its `.ROBLOSECURITY` from a browser on the daemon's machine.
+   Close the browser without logging out.
+3. **Never use that account anywhere else.** No iPad, no phone, no
+   second browser. That's the rule that keeps the cookie alive.
+4. Save the cookie to a single shared file:
+
+   ```bash
+   echo '_|WARNING:-DO-NOT-SHARE-THIS...' > shared_cookie.txt
+   chmod 600 shared_cookie.txt
+   ```
+
+5. Point every kid config at it via `cookie_file`:
+
+   ```json
+   {
+     "roblox_user_id": 10492237089,
+     "cookie_file": "shared_cookie.txt",
+     "child_display_name": "Boys0",
+     "telegram_bot_token": "",
+     "parent_chat_ids": [...],
+     "whitelist_file": "whitelist_universes.json"
+   }
+   ```
+
+   (Omit `roblosecurity_cookie` entirely when using `cookie_file`.)
+
+Each kid's **presence-privacy** must still be set to "Everyone" (Step
+2a) for the parent account to see their game activity — that part is
+account-side and unchanged.
+
+Cookie rotations write back to the shared file atomically (chmod 600);
+sibling daemons pick up the rotated value on their next auth retry.
+When you eventually need to refresh the cookie, you update **one file**
+and every daemon picks it up within a poll cycle.
 
 ---
 
@@ -475,7 +541,8 @@ cookie was grabbed from (see Troubleshooting).
 | Field | Default | Description |
 |---|---|---|
 | `roblox_user_id` | — | Your child's numeric Roblox user ID |
-| `roblosecurity_cookie` | — | Auth cookie (auto-rotated on every response) |
+| `roblosecurity_cookie` | — | Inline auth cookie (auto-rotated on every response). Ignored when `cookie_file` is set. |
+| `cookie_file` | `""` | Path to a plain-text file containing the .ROBLOSECURITY cookie (one line, no JSON). Multiple kid configs can share one — recommended for multi-kid setups, see [Recommended: one dedicated parent-account cookie](#recommended-one-dedicated-parent-account-cookie). Relative paths resolve next to this config. Rotations write back atomically (chmod 600). |
 | `poll_interval_seconds` | `10` | How often to check (seconds). Sub-5s intervals across multiple daemons on one IP tend to get cookies invalidated by Roblox's anti-abuse — leave at 10+ unless you only run one daemon and want faster reaction time. |
 | `notify_parent` | `true` | Desktop notification on the daemon's machine |
 | `child_display_name` | `""` | Friendly name used in Telegram bodies (e.g. `"Emma"`). Falls back to Roblox username. |
@@ -568,26 +635,34 @@ initial 401, manual refreshes should be rare.
 
 ### "My cookies keep getting invalidated every few hours"
 
-This usually means Roblox's anti-abuse has flagged your IP. The two
-biggest causes:
+Three causes, most → least likely:
 
-1. **The daemon was respawning every ~10s against a dead cookie**
+1. **You're using each kid's own cookie, and the kids actively play
+   their accounts.** This is the big one. When the kid opens Roblox on
+   their iPad, their device authenticates and may invalidate the
+   daemon's session as a side effect. Symptoms: cookies die on
+   rolling schedules tracking each kid's usage (morning device
+   pickup, mid-day play, bedtime), not all at the same moment.
+   **Fix:** switch to a single dedicated parent-account cookie via
+   `cookie_file`. See [Recommended: one dedicated parent-account
+   cookie](#recommended-one-dedicated-parent-account-cookie). That
+   cookie will be stable indefinitely because nothing else ever logs
+   into the account.
+
+2. **The daemon was respawning every ~10s against a dead cookie**
    (older `install-service.sh` had `RestartSec=10` and the daemon
    exited on 401). Result: hundreds of 401s/hour to
-   `users.roblox.com/v1/users/authenticated` from one IP, which Roblox
-   responds to by aggressively rotating cookies. **Fix:** re-run
-   `sudo ./install-service.sh install` to pick up the new
-   `RestartSec=60` + in-process auth backoff. The daemon now sleeps
-   5–60 min between auth retries on 401 instead of exiting.
+   `users.roblox.com/v1/users/authenticated` from one IP, which trips
+   anti-abuse. **Fix:** re-run `sudo ./install-service.sh install` to
+   pick up the new `RestartSec=60` + in-process auth backoff. The
+   daemon now sleeps 5–60 min between auth retries on 401 instead of
+   exiting. Symptom of this one: ALL cookies die at the same minute
+   (an IP-wide event), not staggered.
 
-2. **Poll interval too low across multiple daemons.** Six daemons
+3. **Poll interval too low across multiple daemons.** Six daemons
    polling every 3 seconds = ~2 req/s steady-state from one IP, which
    can also trip anti-abuse. Set `poll_interval_seconds` to **10** or
    higher in every config when running multiple kids.
-
-After making these changes, give Roblox an hour or two to forget your
-IP, then grab one fresh cookie. The auto-rotation should hold it
-indefinitely.
 
 ### "Why doesn't the guardian kick the kid out automatically?"
 

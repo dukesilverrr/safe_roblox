@@ -204,6 +204,51 @@ def load_whitelist(config: dict, config_path: Path,
     return {}, None
 
 
+# ── Cookie source resolution ─────────────────────────────────────────────────
+
+def resolve_cookie_source(config: dict, config_path: Path):
+    """
+    Figure out where the .ROBLOSECURITY cookie comes from. Returns
+    (cookie_value, cookie_path_or_None).
+
+    Priority:
+      1. `cookie_file` — path to a plain-text file containing JUST the
+         cookie value on a single line. This is the recommended form
+         when running multiple kid daemons against ONE dedicated
+         parent-account cookie (which is the only architecture that
+         actually keeps a cookie alive long-term, since the kid's own
+         account sessions invalidate cookies when the kid plays on
+         their own device). All kid configs point cookie_file at the
+         same file; cookie rotation writes back to that file and every
+         daemon picks the new value up on its next auth retry.
+      2. Inline `roblosecurity_cookie` field in the kid config
+         (backward compat). cookie_path is None in this case so
+         rotation continues to write back to the kid JSON.
+
+    Relative cookie_file paths resolve next to the kid config (same
+    convention as whitelist_file).
+    """
+    cookie_file = config.get("cookie_file", "")
+    inline = config.get("roblosecurity_cookie", "")
+
+    if cookie_file:
+        cookie_path = Path(cookie_file)
+        if not cookie_path.is_absolute():
+            cookie_path = Path(config_path).parent / cookie_path
+        try:
+            value = cookie_path.read_text().strip()
+        except FileNotFoundError:
+            value = ""
+        # If both are set, file wins but we keep inline as a usable
+        # bootstrap if the file is empty (lets users transition without
+        # racing the daemon's first read).
+        if not value and inline and inline != "PASTE_YOUR_COOKIE_HERE":
+            value = inline
+        return value, cookie_path
+
+    return inline, None
+
+
 # ── Roblox API helpers ───────────────────────────────────────────────────────
 
 API_PRESENCE = "https://presence.roblox.com/v1/presence/users"
@@ -230,10 +275,15 @@ class RobloxSession:
     """
 
     def __init__(self, cookie: str, config_path: Path = CONFIG_FILE,
-                 logger: logging.Logger = None):
+                 logger: logging.Logger = None,
+                 cookie_path: Path = None):
         self.cookie = cookie
         self.csrf_token = ""
         self.config_path = config_path
+        # When cookie_path is set, rotated cookies are written there
+        # (raw text, chmod 600) instead of being patched into the kid
+        # config JSON. Lets multiple kid daemons share one cookie file.
+        self.cookie_path = cookie_path
         self.logger = logger or logging.getLogger("guardian")
 
     def _build_headers(self, extra: dict = None) -> dict:
@@ -418,12 +468,30 @@ class RobloxSession:
 
     def _save_cookie(self, new_cookie: str):
         """
-        Persist the rotated cookie back to the config file atomically.
-        Write to a sibling temp file then os.replace() — that's atomic
-        on POSIX and Windows, so a crash mid-write can't truncate the
-        user's config and lose their cookie.
+        Persist the rotated cookie atomically. If we're configured to
+        use a shared cookie file (cookie_path), write raw text there;
+        otherwise patch the value into the kid config JSON. Both paths
+        write via a sibling temp + os.replace so a crash mid-write
+        can't truncate the destination.
+
+        Non-fatal on failure: the in-memory cookie is already updated,
+        so the running process keeps working with the new value even
+        if we can't persist.
         """
         try:
+            if self.cookie_path is not None:
+                tmp_path = f"{self.cookie_path}.tmp"
+                with open(tmp_path, "w") as f:
+                    f.write(new_cookie + "\n")
+                # chmod BEFORE replace so the live file is never
+                # world-readable, even for a moment.
+                try:
+                    os.chmod(tmp_path, 0o600)
+                except OSError:
+                    pass
+                os.replace(tmp_path, self.cookie_path)
+                return
+
             with open(self.config_path) as f:
                 config = json.load(f)
             config["roblosecurity_cookie"] = new_cookie
@@ -432,9 +500,6 @@ class RobloxSession:
                 json.dump(config, f, indent=2)
             os.replace(tmp_path, self.config_path)
         except Exception:
-            # Non-fatal: the in-memory cookie is already updated, so
-            # the running process keeps working with the new cookie
-            # even if we can't persist it.
             pass
 
 
@@ -622,10 +687,14 @@ class WhitelistGuardian:
         default_log_path = str(Path(self.config_path).with_suffix(".log"))
         log_path = config.get("log_file") or default_log_path
         self.logger = setup_logging(log_path, debug=debug)
+        cookie_value, self._cookie_path = resolve_cookie_source(
+            config, self.config_path
+        )
         self.session = RobloxSession(
-            config["roblosecurity_cookie"],
+            cookie_value,
             config_path=self.config_path,
             logger=self.logger,
+            cookie_path=self._cookie_path,
         )
         self.poll_interval = config.get("poll_interval_seconds", 5)
         self.notify = config.get("notify_parent", True)
@@ -669,8 +738,10 @@ class WhitelistGuardian:
         self._last_universe = None
         self._violation_count = 0
 
-        # Warn about outdated cookie format (May 2026 changes)
-        self._check_cookie_format(config["roblosecurity_cookie"])
+        # Warn about outdated cookie format (May 2026 changes). Use
+        # the resolved value, not config[...] — cookie_file configs
+        # don't have an inline roblosecurity_cookie.
+        self._check_cookie_format(cookie_value)
 
         # Deprecation notice for old config fields.
         deprecated_used = [k for k in (
@@ -785,23 +856,37 @@ class WhitelistGuardian:
 
     def _reload_cookie_from_disk(self):
         """
-        Pick up a fresh .ROBLOSECURITY value the user may have edited
-        into the config while we were sleeping in auth backoff. Without
-        this, a user updating the cookie wouldn't take effect until the
-        daemon was restarted — defeating the whole point of staying
-        running through a 401 storm.
+        Pick up a fresh .ROBLOSECURITY the user may have edited in
+        while we were sleeping in auth backoff. Reads from the shared
+        cookie file if one is configured, otherwise from the kid
+        config JSON. Without this, a user updating the cookie wouldn't
+        take effect until the daemon was restarted — defeating the
+        point of staying running through a 401 storm.
+
+        Also picks up rotations written by SIBLING daemons sharing the
+        same cookie file: when daemon A's traffic causes Roblox to
+        rotate, A writes the new value to the shared file and B (now
+        in auth backoff with a stale in-memory copy) picks it up on
+        its next attempt.
         """
         try:
-            with open(self.config_path) as f:
-                disk_cfg = json.load(f)
-            disk_cookie = disk_cfg.get("roblosecurity_cookie", "")
+            if self._cookie_path is not None:
+                try:
+                    disk_cookie = self._cookie_path.read_text().strip()
+                except FileNotFoundError:
+                    return
+            else:
+                with open(self.config_path) as f:
+                    disk_cfg = json.load(f)
+                disk_cookie = disk_cfg.get("roblosecurity_cookie", "")
+
             if disk_cookie and disk_cookie != self.session.cookie:
                 self.logger.info(
                     "Detected updated cookie on disk; loading fresh value."
                 )
                 self.session.cookie = disk_cookie
         except Exception as e:
-            self.logger.debug(f"Could not re-read config for cookie: {e}")
+            self.logger.debug(f"Could not re-read cookie from disk: {e}")
 
     def _auth_loop(self, start_attempt: int = 0):
         """
@@ -1032,9 +1117,16 @@ class WhitelistGuardian:
             f"Authenticated as {me.get('name')} (id={me.get('id')})"
         )
         if me.get("id") != self.user_id:
-            self.logger.warning(
-                f"Cookie belongs to user {me.get('id')} but config monitors "
-                f"{self.user_id}. Make sure this is intentional."
+            # With a shared parent-account cookie (recommended for
+            # multi-kid setups) this mismatch is expected: one bot
+            # account watches N kids. Log at info, not warning, when
+            # cookie_file is in use; warning otherwise.
+            level = (self.logger.info if self._cookie_path is not None
+                     else self.logger.warning)
+            level(
+                f"Cookie belongs to user {me.get('id')} ({me.get('name')}); "
+                f"this daemon monitors user {self.user_id} via the Presence "
+                f"API. (Expected when sharing a parent-account cookie file.)"
             )
 
         self.logger.info(f"Whitelisted universes: {len(self.whitelist)}")
@@ -1206,7 +1298,7 @@ def lookup_game(keyword: str, cookie: str = ""):
         print(f'  "{ex.get("universeId", "ID")}": "{ex.get("name", "Name")}"\n')
 
 
-def cmd_check(config: dict) -> int:
+def cmd_check(config: dict, config_path: Path = CONFIG_FILE) -> int:
     """
     Preflight diagnostic: verify the cookie is valid and that Roblox is
     reporting enough presence data for the guardian to actually work.
@@ -1219,13 +1311,23 @@ def cmd_check(config: dict) -> int:
     print("=" * 60)
 
     user_id = config.get("roblox_user_id", 0)
-    cookie = config.get("roblosecurity_cookie", "")
+    cookie, cookie_path = resolve_cookie_source(config, config_path)
     if not user_id:
         print("\n  ✗ No roblox_user_id set in config.\n")
         return 1
     if not cookie or cookie == "PASTE_YOUR_COOKIE_HERE":
-        print("\n  ✗ No .ROBLOSECURITY cookie set in config.\n")
+        if cookie_path is not None:
+            print(f"\n  ✗ cookie_file points at {cookie_path} but it's")
+            print( "    missing or empty. Paste the .ROBLOSECURITY value")
+            print( "    (just the cookie string, one line) into that file.\n")
+        else:
+            print("\n  ✗ No .ROBLOSECURITY cookie set in config.\n")
         return 1
+
+    if cookie_path is not None:
+        print(f"\nCookie source: {cookie_path} (shared)")
+    else:
+        print(f"\nCookie source: inline in {config_path.name}")
 
     session = RobloxSession(cookie)
 
@@ -1279,11 +1381,15 @@ def cmd_check(config: dict) -> int:
             f"{me.get('name')} (id={me.get('id')})"
         )
         if me.get("id") != user_id:
+            marker = "·" if cookie_path is not None else "⚠"
             print(
-                f"  ⚠  Cookie belongs to user {me.get('id')} but config "
-                f"monitors {user_id}."
+                f"  {marker}  Cookie belongs to user {me.get('id')} "
+                f"({me.get('name')}); config monitors {user_id}."
             )
-            print("     Presence works for any user, but confirm this is intentional.")
+            if cookie_path is not None:
+                print("     (Expected — shared parent-account cookie pattern.)")
+            else:
+                print("     Presence works for any user, but confirm this is intentional.")
 
     # 2. Presence (skip if cookie failed)
     print(f"\n[2/2] Fetching presence for user {user_id}...")
@@ -1585,7 +1691,7 @@ def main():
 
     # ── Preflight diagnostic
     if args.check:
-        sys.exit(cmd_check(config))
+        sys.exit(cmd_check(config, config_path))
 
     # ── Test Telegram delivery
     if args.test_telegram:
@@ -1599,11 +1705,17 @@ def main():
         print("ERROR: Set your child's roblox_user_id in the config file.")
         sys.exit(1)
 
-    if config.get("roblosecurity_cookie") == "PASTE_YOUR_COOKIE_HERE":
-        print("ERROR: Set the .ROBLOSECURITY cookie in the config file.")
-        print("  1. Log into your child's Roblox account in a browser")
-        print("  2. Open DevTools (F12) → Application → Cookies → .ROBLOSECURITY")
-        print("  3. Copy the value into the config file")
+    cookie_value, _ = resolve_cookie_source(config, config_path)
+    if not cookie_value or cookie_value == "PASTE_YOUR_COOKIE_HERE":
+        print("ERROR: No .ROBLOSECURITY cookie available.")
+        if config.get("cookie_file"):
+            print(f"  cookie_file={config['cookie_file']} is empty or missing.")
+            print( "  Paste the cookie value into that file (one line, no JSON).")
+        else:
+            print("  1. Log into the Roblox account in a browser")
+            print("  2. DevTools (F12) → Application → Cookies → .ROBLOSECURITY")
+            print("  3. Copy the value into the config file, or set cookie_file")
+            print("     to a shared cookie file (recommended for multi-kid).")
         sys.exit(1)
 
     guardian = WhitelistGuardian(config, dry_run=args.dry_run,
